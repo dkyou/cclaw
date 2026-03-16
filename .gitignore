@@ -1,0 +1,5 @@
+.cache
+build
+cclaw.db
+test.sh
+compile_commands.json
