@@ -165,12 +165,29 @@ const claw_memory_api_t *claw_registry_get_memory(const claw_registry_t *r, cons
     return NULL;
 }
 
+static int tool_name_matches(const char *registered, const char *requested)
+{
+    if (!registered || !requested) return 0;
+    if (strcmp(registered, requested) == 0) return 1;
+    if ((strcmp(requested, "tool_exec") == 0 && strcmp(registered, "exec") == 0) ||
+        (strcmp(requested, "file_read") == 0 && strcmp(registered, "fs.read") == 0) ||
+        (strcmp(requested, "file_write") == 0 && strcmp(registered, "fs.write") == 0) ||
+        (strcmp(requested, "dir_list") == 0 && strcmp(registered, "fs.list") == 0) ||
+        (strcmp(requested, "exec") == 0 && strcmp(registered, "tool_exec") == 0) ||
+        (strcmp(requested, "fs.read") == 0 && strcmp(registered, "file_read") == 0) ||
+        (strcmp(requested, "fs.write") == 0 && strcmp(registered, "file_write") == 0) ||
+        (strcmp(requested, "fs.list") == 0 && strcmp(registered, "dir_list") == 0)) {
+        return 1;
+    }
+    return 0;
+}
+
 const claw_tool_api_t *claw_registry_get_tool(const claw_registry_t *r, const char *name)
 {
     size_t i;
     if (!r || !name) return NULL;
     for (i = 0; i < r->tool_count; ++i) {
-        if (r->tools[i] && r->tools[i]->name && strcmp(r->tools[i]->name, name) == 0) {
+        if (r->tools[i] && r->tools[i]->name && tool_name_matches(r->tools[i]->name, name)) {
             return r->tools[i];
         }
     }

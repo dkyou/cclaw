@@ -3,3 +3,10 @@ build
 cclaw.db
 test.sh
 compile_commands.json
+state
+tmp_v10
+*.db
+*.out
+*.err
+*.txt
+*.example

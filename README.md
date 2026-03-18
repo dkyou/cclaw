@@ -1,96 +1,134 @@
-# cclaw_runtime
+## v11 additions
 
-一个最小可运行的 C 版 agent runtime 骨架，包含：
+- typed tool names: `exec`, `fs.read`, `fs.write`, `fs.list`
+- dedicated HTTP routes: `/v1/tools/exec`, `/v1/fs/read`, `/v1/fs/write`, `/v1/fs/list`
+- legacy aliases preserved: `tool_exec`, `file_read`, `file_write`, `dir_list`
 
-- `provider_openai_compat.so`：OpenAI 兼容 Chat Completions provider
-- `memory_sqlite.so`：SQLite KV memory plugin
-- `provider_echo.so`：本地测试 provider
+# cclaw runtime v9
 
-## 目录
+新增能力：
 
-- `include/claw/plugin_api.h`：插件 ABI
-- `include/claw/core.h`：registry 接口
-- `src/core/`：插件加载与 CLI 驱动
-- `plugins/provider_openai_compat/`：真实 provider
-- `plugins/memory_sqlite/`：SQLite memory
+- tool_shell 结构化 ABI
+  - `argv`
+  - `argv + env`
+  - `argv + env + cwd`
+  - `command + env + cwd`
+- scheduler 更完整 cron 语义
+  - 5 段或 6 段 cron
+  - `*`
+  - `*/n`
+  - 单值
+  - 范围
+  - 逗号列表
+  - 月份/星期英文缩写，例如 `JAN`, `MON-FRI`
+  - DOM/DOW 更接近标准 cron 的匹配语义
+- scheduler 时区支持
+  - 每个任务可单独指定 `timezone`
+  - 默认时区可由 `CLAW_SCHEDULER_TZ` 提供
 
-## 编译
-
-系统需要：
-
-- C 编译器
-- `pkg-config`
-- `libcurl`
-- `sqlite3`
-
-编译：
+## 构建
 
 ```bash
 make
 ```
 
-## 运行
+## tool_shell：结构化 argv/env/cwd
 
-### 1. 本地 echo 测试
-
-```bash
-./build/cclaw build/plugins chat echo "hello runtime"
-```
-
-### 2. SQLite memory
-
-默认数据库路径：`./cclaw.db`
+CLI：
 
 ```bash
-./build/cclaw build/plugins mem-put sqlite greeting hello
-./build/cclaw build/plugins mem-get sqlite greeting
+export CLAW_TOOL_SHELL_ALLOWED_ROOTS="$PWD"
+./build/cclaw build/plugins tool-invoke shell '{"argv":["/usr/bin/env"],"env":{"FOO":"BAR"},"cwd":"."}'
 ```
 
-自定义数据库路径：
+HTTP：
 
 ```bash
-export CLAW_SQLITE_PATH=/tmp/cclaw.db
-./build/cclaw build/plugins mem-put sqlite greeting hello
-./build/cclaw build/plugins mem-get sqlite greeting
+curl -X POST http://127.0.0.1:8080/v1/tool/shell \
+  -H 'Content-Type: application/json' \
+  -d '{"argv":["/usr/bin/env"],"env":{"FOO":"BAR"},"cwd":"."}'
 ```
 
-### 3. OpenAI-compatible provider
+## scheduler：cron + timezone
 
-支持所有兼容 `POST /v1/chat/completions` 的接口。
-
-必要环境变量：
+CLI：
 
 ```bash
-export CLAW_OPENAI_API_KEY="your_api_key"
+export CLAW_RUNTIME_DB_PATH=./state/runtime.db
+./build/cclaw build/plugins scheduler-add-cron "*/5 * * * *" chat echo "hello cron"
+./build/cclaw build/plugins scheduler-add-cron-tz "0 9 * * MON-FRI" Asia/Tokyo chat echo "weekday 9am"
+./build/cclaw build/plugins scheduler-tasks
 ```
 
-可选环境变量：
+HTTP：
 
 ```bash
-export CLAW_OPENAI_BASE_URL="https://api.openai.com"
-export CLAW_OPENAI_CHAT_PATH="/v1/chat/completions"
-export CLAW_OPENAI_MODEL="gpt-4o-mini"
+curl -X POST http://127.0.0.1:8080/v1/scheduler/task/upsert \
+  -H 'Content-Type: application/json' \
+  -d '{"schedule_type":"cron","cron_expr":"0 9 * * MON-FRI","timezone":"Asia/Tokyo","kind":"chat","target":"echo","arg1":"hello tz"}'
 ```
 
-调用：
+
+## v10 additions
+
+Structured tools added:
+
+- `exec`: pure argv execution with optional `env`, `cwd`, `timeout_ms`
+- `file_read`: read a file under allowed roots
+- `file_write`: write or append a file under allowed roots
+- `dir_list`: list directory entries under allowed roots
+
+Examples:
 
 ```bash
-./build/cclaw build/plugins chat openai_compat "Tell me a joke."
+./build/cclaw build/plugins tool-invoke exec '{"argv":["printf","hi"],"cwd":"."}'
+./build/cclaw build/plugins tool-invoke file_write '{"path":"./tmp/test.txt","content":"hello","mode":"overwrite"}'
+./build/cclaw build/plugins tool-invoke file_read '{"path":"./tmp/test.txt"}'
+./build/cclaw build/plugins tool-invoke dir_list '{"path":"./tmp"}'
 ```
 
-### OpenRouter 示例
+Scheduler task JSON now includes local-time observability fields:
+
+- `next_due_local`
+- `last_run_local`
+- `created_at_local`
+- `updated_at_local`
+- `scheduler_now_local` in scheduler status
+
+
+## v12 typed tool ABI
+
+Typed tools now return structured JSON with schema validation errors:
+- exec
+- fs.read
+- fs.write
+- fs.list
+
+Examples:
 
 ```bash
-export CLAW_OPENAI_API_KEY="your_openrouter_key"
-export CLAW_OPENAI_BASE_URL="https://openrouter.ai/api"
-export CLAW_OPENAI_CHAT_PATH="/v1/chat/completions"
-export CLAW_OPENAI_MODEL="openai/gpt-4o-mini"
-./build/cclaw build/plugins chat openai_compat "hello"
+./build/cclaw build/plugins tool-invoke exec '{"argv":["printf","hi"],"cwd":"."}'
+./build/cclaw build/plugins tool-invoke fs.write '{"path":"./tmp.txt","content":"abc","mode":"overwrite"}'
+./build/cclaw build/plugins tool-invoke fs.read '{"path":"./tmp.txt"}'
+./build/cclaw build/plugins tool-invoke fs.list '{"path":".","max_entries":5}'
 ```
 
-## 当前限制
+HTTP typed routes:
 
-- provider 只做了非流式 chat completions
-- JSON 解析是轻量定制实现，不是完整 JSON 解析器
-- memory 当前是 KV 读写，还没有 FTS5 / embedding / search
-- 主程序还是 CLI 驱动，HTTP gateway 还没接
+```bash
+curl -X POST http://127.0.0.1:8080/v1/tools/exec   -H 'Content-Type: application/json'   -d '{"argv":["printf","via_http"],"cwd":"."}'
+
+curl -X POST http://127.0.0.1:8080/v1/fs/write   -H 'Content-Type: application/json'   -d '{"path":"./http.txt","content":"hello","mode":"overwrite"}'
+```
+
+
+## v13 additions
+
+- Tool schema registry with versioned typed ABI for tools.
+- `list` now exposes `tool_schemas` automatically.
+- New CLI:
+  - `tool-schemas`
+  - `tool-schema <name>`
+- New HTTP:
+  - `GET /v1/tools/schemas`
+  - `GET /v1/tools/schema?name=<tool>`

@@ -24,6 +24,17 @@
 #define CLAW_TOOL_SHELL_DEFAULT_AS_MB 256L
 #define CLAW_TOOL_SHELL_DEFAULT_FSIZE_MB 8L
 #define CLAW_TOOL_SHELL_DEFAULT_NOFILE 32L
+#define CLAW_TOOL_SHELL_MAX_ARGV 64
+#define CLAW_TOOL_SHELL_ARG_CAP 1024
+#define CLAW_TOOL_SHELL_MAX_ENV 32
+#define CLAW_TOOL_SHELL_ENV_KEY_CAP 128
+#define CLAW_TOOL_SHELL_ENV_VAL_CAP 1024
+
+
+typedef struct {
+    char key[CLAW_TOOL_SHELL_ENV_KEY_CAP];
+    char value[CLAW_TOOL_SHELL_ENV_VAL_CAP];
+} claw_shell_env_kv_t;
 
 static const char *skip_ws(const char *p)
 {
@@ -41,9 +52,8 @@ static int hex_value(char c)
 
 static int utf8_from_codepoint(unsigned cp, char out[4], size_t *n)
 {
-    if (cp <= 0x7F) {
-        out[0] = (char)cp; *n = 1;
-    } else if (cp <= 0x7FF) {
+    if (cp <= 0x7F) { out[0] = (char)cp; *n = 1; }
+    else if (cp <= 0x7FF) {
         out[0] = (char)(0xC0 | (cp >> 6));
         out[1] = (char)(0x80 | (cp & 0x3F));
         *n = 2;
@@ -73,8 +83,7 @@ static const char *find_json_string_field(const char *json, const char *field)
     p = strchr(p, ':');
     if (!p) return NULL;
     p = skip_ws(p + 1);
-    if (*p != '"') return NULL;
-    return p;
+    return *p == '"' ? p : NULL;
 }
 
 static int decode_json_string(const char *quoted, claw_response_t *out)
@@ -162,6 +171,131 @@ static int json_get_long(const char *json, const char *field, long *value_out)
     return 0;
 }
 
+static const char *find_json_array_field(const char *json, const char *field)
+{
+    char key[128];
+    const char *p;
+    if (!json || !field) return NULL;
+    if (snprintf(key, sizeof(key), "\"%s\"", field) >= (int)sizeof(key)) return NULL;
+    p = strstr(json, key);
+    if (!p) return NULL;
+    p = strchr(p, ':');
+    if (!p) return NULL;
+    p = skip_ws(p + 1);
+    return *p == '[' ? p : NULL;
+}
+
+static int json_get_string_array(const char *json, const char *field,
+    char items[][CLAW_TOOL_SHELL_ARG_CAP], size_t max_items, size_t *count_out)
+{
+    const char *p = find_json_array_field(json, field);
+    size_t count = 0;
+    if (!p || !items || !count_out || max_items == 0) return -1;
+    ++p;
+    for (;;) {
+        claw_response_t tmp;
+        const char *q;
+        p = skip_ws(p);
+        if (*p == ']') {
+            *count_out = count;
+            return 0;
+        }
+        if (*p != '"' || count >= max_items) return -2;
+        claw_response_init(&tmp, items[count], CLAW_TOOL_SHELL_ARG_CAP);
+        if (decode_json_string(p, &tmp) != 0) return -3;
+        q = p + 1;
+        while (*q) {
+            if (*q == '"') { ++q; break; }
+            if (*q == '\\') {
+                ++q;
+                if (!*q) return -4;
+                if (*q == 'u') {
+                    if (!q[1] || !q[2] || !q[3] || !q[4]) return -5;
+                    q += 4;
+                }
+            }
+            ++q;
+        }
+        if (*(q - 1) != '"') return -6;
+        ++count;
+        p = skip_ws(q);
+        if (*p == ',') { ++p; continue; }
+        if (*p == ']') { *count_out = count; return 0; }
+        return -7;
+    }
+}
+static const char *find_json_object_field(const char *json, const char *field)
+{
+    char key[128];
+    const char *p;
+    if (!json || !field) return NULL;
+    if (snprintf(key, sizeof(key), "\"%s\"", field) >= (int)sizeof(key)) return NULL;
+    p = strstr(json, key);
+    if (!p) return NULL;
+    p = strchr(p, ':');
+    if (!p) return NULL;
+    p = skip_ws(p + 1);
+    return *p == '{' ? p : NULL;
+}
+
+static int env_key_valid(const char *key)
+{
+    size_t i;
+    if (!key || !key[0]) return 0;
+    if (!((key[0] >= 'A' && key[0] <= 'Z') || (key[0] >= 'a' && key[0] <= 'z') || key[0] == '_')) return 0;
+    for (i = 1; key[i]; ++i) {
+        if (!((key[i] >= 'A' && key[i] <= 'Z') || (key[i] >= 'a' && key[i] <= 'z') ||
+              (key[i] >= '0' && key[i] <= '9') || key[i] == '_')) return 0;
+    }
+    return 1;
+}
+
+static int json_get_env_object(const char *json, const char *field,
+    claw_shell_env_kv_t items[], size_t max_items, size_t *count_out)
+{
+    const char *p = find_json_object_field(json, field);
+    size_t count = 0;
+    if (!p || !items || !count_out) return -1;
+    ++p;
+    for (;;) {
+        claw_response_t tmp;
+        const char *q;
+        p = skip_ws(p);
+        if (*p == '}') { *count_out = count; return 0; }
+        if (*p != '"' || count >= max_items) return -2;
+        claw_response_init(&tmp, items[count].key, sizeof(items[count].key));
+        if (decode_json_string(p, &tmp) != 0 || !env_key_valid(items[count].key)) return -3;
+        q = p + 1;
+        while (*q) {
+            if (*q == '"') { ++q; break; }
+            if (*q == '\\') { ++q; if (!*q) return -4; if (*q == 'u') { if (!q[1] || !q[2] || !q[3] || !q[4]) return -5; q += 4; } }
+            ++q;
+        }
+        if (*(q - 1) != '"') return -6;
+        p = skip_ws(q);
+        if (*p != ':') return -7;
+        p = skip_ws(p + 1);
+        if (*p != '"') return -8;
+        claw_response_init(&tmp, items[count].value, sizeof(items[count].value));
+        if (decode_json_string(p, &tmp) != 0) return -9;
+        q = p + 1;
+        while (*q) {
+            if (*q == '"') { ++q; break; }
+            if (*q == '\\') { ++q; if (!*q) return -10; if (*q == 'u') { if (!q[1] || !q[2] || !q[3] || !q[4]) return -11; q += 4; } }
+            ++q;
+        }
+        if (*(q - 1) != '"') return -12;
+        ++count;
+        p = skip_ws(q);
+        if (*p == ',') { ++p; continue; }
+        if (*p == '}') { *count_out = count; return 0; }
+        return -13;
+    }
+}
+
+
+
+
 static long env_long_or_default(const char *name, long fallback)
 {
     const char *v = getenv(name);
@@ -192,6 +326,103 @@ static long clamp_timeout_ms(long requested)
     return timeout_ms;
 }
 
+static const char *path_basename_const(const char *s)
+{
+    const char *slash;
+    if (!s) return "";
+    slash = strrchr(s, '/');
+    return slash ? slash + 1 : s;
+}
+
+static int command_has_dangerous_metachar(const char *cmd)
+{
+    const unsigned char *p = (const unsigned char *)cmd;
+    if (!cmd) return 1;
+    for (; *p; ++p) {
+        switch (*p) {
+        case ';': case '|': case '&': case '>': case '<': case '`': case '$': case '(':
+        case ')': case '\n': case '\r':
+            return 1;
+        default:
+            break;
+        }
+    }
+    return 0;
+}
+
+static int extract_first_token(const char *cmd, char *out, size_t out_cap)
+{
+    const char *p = skip_ws(cmd);
+    size_t n = 0;
+    if (!p || !*p || !out || out_cap == 0) return -1;
+    while (*p && *p != ' ' && *p != '\t') {
+        if (strchr(";|&><`$()", *p)) break;
+        if (n + 1 >= out_cap) return -2;
+        out[n++] = *p++;
+    }
+    if (n == 0) return -3;
+    out[n] = '\0';
+    return 0;
+}
+
+static int list_contains_token(const char *list, const char *token)
+{
+    const char *p = list;
+    size_t tok_len;
+    if (!list || !*list || !token || !*token) return 0;
+    tok_len = strlen(token);
+    while (*p) {
+        const char *start;
+        size_t len = 0;
+        while (*p == ' ' || *p == '\t' || *p == ',' || *p == ':') ++p;
+        start = p;
+        while (*p && *p != ',' && *p != ':' && *p != ' ' && *p != '\t') { ++p; ++len; }
+        if (len == tok_len && strncmp(start, token, tok_len) == 0) return 1;
+        while (*p == ' ' || *p == '\t') ++p;
+        if (*p == ',' || *p == ':') ++p;
+    }
+    return 0;
+}
+
+static int enforce_program_policy(const char *program, claw_response_t *resp)
+{
+    const char *allow = getenv("CLAW_TOOL_SHELL_COMMAND_ALLOWLIST");
+    const char *deny = getenv("CLAW_TOOL_SHELL_COMMAND_DENYLIST");
+    const char *base;
+    if (!program || !*program) {
+        (void)claw_response_append(resp, "missing program");
+        return -1;
+    }
+    base = path_basename_const(program);
+    if (deny && *deny && (list_contains_token(deny, program) || list_contains_token(deny, base))) {
+        (void)claw_response_append(resp, "command rejected by denylist policy");
+        return -2;
+    }
+    if (allow && *allow && !(list_contains_token(allow, program) || list_contains_token(allow, base))) {
+        (void)claw_response_append(resp, "command rejected by allowlist policy");
+        return -3;
+    }
+    return 0;
+}
+
+static int enforce_command_policy(const char *command, claw_response_t *resp)
+{
+    int simple_required;
+    char token[256];
+    const char *allow = getenv("CLAW_TOOL_SHELL_COMMAND_ALLOWLIST");
+    const char *deny = getenv("CLAW_TOOL_SHELL_COMMAND_DENYLIST");
+    simple_required = env_bool_or_default("CLAW_TOOL_SHELL_REQUIRE_SIMPLE_COMMAND", ((allow && *allow) || (deny && *deny)) ? 1 : 0);
+    if (simple_required && command_has_dangerous_metachar(command)) {
+        (void)claw_response_append(resp, "command rejected by simple-command policy");
+        return -1;
+    }
+    if (extract_first_token(command, token, sizeof(token)) != 0) {
+        (void)claw_response_append(resp, "unable to parse command token");
+        return -2;
+    }
+    return enforce_program_policy(token, resp);
+}
+
 static int append_status_line(claw_response_t *resp, const char *prefix, int value)
 {
     char tmp[64];
@@ -199,16 +430,14 @@ static int append_status_line(claw_response_t *resp, const char *prefix, int val
     if (claw_response_append(resp, prefix) != 0) return -1;
     if (snprintf(tmp, sizeof(tmp), "%d", value) <= 0) return -1;
     if (claw_response_append(resp, tmp) != 0) return -1;
-    if (claw_response_append(resp, "]") != 0) return -1;
-    return 0;
+    return claw_response_append(resp, "]");
 }
 
 static int append_note(claw_response_t *resp, const char *note)
 {
     if (claw_response_append(resp, "\n[") != 0) return -1;
     if (claw_response_append(resp, note) != 0) return -1;
-    if (claw_response_append(resp, "]") != 0) return -1;
-    return 0;
+    return claw_response_append(resp, "]");
 }
 
 static int set_cloexec(int fd)
@@ -251,10 +480,8 @@ static int split_allowed_roots(char roots[][PATH_MAX], size_t *count)
     const char *env = getenv("CLAW_TOOL_SHELL_ALLOWED_ROOTS");
     char cwd[PATH_MAX];
     size_t n = 0;
-
     if (!count) return -1;
     *count = 0;
-
     if (!env || !*env) {
         if (!getcwd(cwd, sizeof(cwd))) return -1;
         strncpy(roots[0], cwd, PATH_MAX - 1);
@@ -262,7 +489,6 @@ static int split_allowed_roots(char roots[][PATH_MAX], size_t *count)
         *count = 1;
         return 0;
     }
-
     while (*env && n < 16) {
         char token[PATH_MAX];
         size_t len = 0;
@@ -310,17 +536,63 @@ static void child_apply_limits(void)
     long as_mb = env_long_or_default("CLAW_TOOL_SHELL_AS_LIMIT_MB", CLAW_TOOL_SHELL_DEFAULT_AS_MB);
     long fsize_mb = env_long_or_default("CLAW_TOOL_SHELL_FSIZE_LIMIT_MB", CLAW_TOOL_SHELL_DEFAULT_FSIZE_MB);
     long nofile = env_long_or_default("CLAW_TOOL_SHELL_NOFILE_LIMIT", CLAW_TOOL_SHELL_DEFAULT_NOFILE);
-
     if (cpu_sec < 1) cpu_sec = CLAW_TOOL_SHELL_DEFAULT_CPU_SEC;
     if (as_mb < 32) as_mb = CLAW_TOOL_SHELL_DEFAULT_AS_MB;
     if (fsize_mb < 1) fsize_mb = CLAW_TOOL_SHELL_DEFAULT_FSIZE_MB;
     if (nofile < 8) nofile = CLAW_TOOL_SHELL_DEFAULT_NOFILE;
+    (void)set_limit(RLIMIT_CPU, (rlim_t)cpu_sec, (rlim_t)cpu_sec);
+    (void)set_limit(RLIMIT_AS, (rlim_t)as_mb * 1024u * 1024u, (rlim_t)as_mb * 1024u * 1024u);
+    (void)set_limit(RLIMIT_FSIZE, (rlim_t)fsize_mb * 1024u * 1024u, (rlim_t)fsize_mb * 1024u * 1024u);
+    (void)set_limit(RLIMIT_NOFILE, (rlim_t)nofile, (rlim_t)nofile);
+    (void)set_limit(RLIMIT_CORE, 0, 0);
+}
 
-    set_limit(RLIMIT_CPU, (rlim_t)cpu_sec, (rlim_t)cpu_sec);
-    set_limit(RLIMIT_AS, (rlim_t)as_mb * 1024u * 1024u, (rlim_t)as_mb * 1024u * 1024u);
-    set_limit(RLIMIT_FSIZE, (rlim_t)fsize_mb * 1024u * 1024u, (rlim_t)fsize_mb * 1024u * 1024u);
-    set_limit(RLIMIT_NOFILE, (rlim_t)nofile, (rlim_t)nofile);
-    set_limit(RLIMIT_CORE, 0, 0);
+static int find_env_slot(char keys[][CLAW_TOOL_SHELL_ENV_KEY_CAP], size_t count, const char *key)
+{
+    size_t i;
+    for (i = 0; i < count; ++i) if (strcmp(keys[i], key) == 0) return (int)i;
+    return -1;
+}
+
+static int set_env_entry(char keys[][CLAW_TOOL_SHELL_ENV_KEY_CAP], char vals[][CLAW_TOOL_SHELL_ENV_VAL_CAP], size_t *count,
+    const char *key, const char *value)
+{
+    int idx;
+    if (!keys || !vals || !count || !key || !value || !env_key_valid(key)) return -1;
+    idx = find_env_slot(keys, *count, key);
+    if (idx < 0) {
+        if (*count >= CLAW_TOOL_SHELL_MAX_ENV + 8) return -2;
+        idx = (int)(*count);
+        *count += 1;
+    }
+    snprintf(keys[idx], CLAW_TOOL_SHELL_ENV_KEY_CAP, "%s", key);
+    snprintf(vals[idx], CLAW_TOOL_SHELL_ENV_VAL_CAP, "%s", value);
+    return 0;
+}
+
+static int build_envp(const char *cwd_real, const claw_shell_env_kv_t extra[], size_t extra_count,
+    char keys[][CLAW_TOOL_SHELL_ENV_KEY_CAP], char vals[][CLAW_TOOL_SHELL_ENV_VAL_CAP], char *envp[])
+{
+    size_t i, count = 0;
+    if (set_env_entry(keys, vals, &count, "PATH", "/usr/bin:/bin") != 0) return -1;
+    if (set_env_entry(keys, vals, &count, "LANG", "C") != 0) return -1;
+    if (set_env_entry(keys, vals, &count, "HOME", cwd_real) != 0) return -1;
+    if (set_env_entry(keys, vals, &count, "PWD", cwd_real) != 0) return -1;
+    for (i = 0; i < extra_count; ++i) {
+        if (set_env_entry(keys, vals, &count, extra[i].key, extra[i].value) != 0) return -1;
+    }
+    for (i = 0; i < count; ++i) envp[i] = vals[i];
+    for (i = 0; i < count; ++i) {
+        size_t k = strlen(keys[i]);
+        size_t v = strlen(vals[i]);
+        if (k + 1 + v + 1 > CLAW_TOOL_SHELL_ENV_VAL_CAP) return -1;
+        memmove(vals[i] + k + 1, vals[i], v + 1);
+        memcpy(vals[i], keys[i], k);
+        vals[i][k] = '=';
+        envp[i] = vals[i];
+    }
+    envp[count] = NULL;
+    return 0;
 }
 
 static int drain_pipe_limited(int fd, claw_response_t *resp, size_t *captured, size_t max_output, int *eof, int *truncated)
@@ -330,22 +602,13 @@ static int drain_pipe_limited(int fd, claw_response_t *resp, size_t *captured, s
         ssize_t n = read(fd, buf, sizeof(buf));
         if (n > 0) {
             size_t keep = (size_t)n;
-            if (*captured >= max_output) {
-                *truncated = 1;
-                continue;
-            }
-            if (*captured + keep > max_output) {
-                keep = max_output - *captured;
-                *truncated = 1;
-            }
+            if (*captured >= max_output) { *truncated = 1; continue; }
+            if (*captured + keep > max_output) { keep = max_output - *captured; *truncated = 1; }
             if (keep > 0 && claw_response_append_mem(resp, buf, keep) != 0) return -1;
             *captured += keep;
             continue;
         }
-        if (n == 0) {
-            *eof = 1;
-            return 0;
-        }
+        if (n == 0) { *eof = 1; return 0; }
         if (errno == EINTR) continue;
         if (errno == EAGAIN || errno == EWOULDBLOCK) return 0;
         return -2;
@@ -357,6 +620,10 @@ static int shell_tool_invoke(const char *json_args, claw_response_t *resp)
     char command[4096];
     char cwd_input[PATH_MAX];
     char cwd_real[PATH_MAX];
+    char argv_items[CLAW_TOOL_SHELL_MAX_ARGV][CLAW_TOOL_SHELL_ARG_CAP];
+    char *argv_exec[CLAW_TOOL_SHELL_MAX_ARGV + 1];
+    claw_shell_env_kv_t env_items[CLAW_TOOL_SHELL_MAX_ENV];
+    size_t argv_count = 0, env_count = 0;
     long timeout_ms;
     long max_output = env_long_or_default("CLAW_TOOL_SHELL_MAX_OUTPUT_BYTES", CLAW_TOOL_SHELL_DEFAULT_MAX_OUTPUT);
     long max_command = env_long_or_default("CLAW_TOOL_SHELL_MAX_COMMAND_BYTES", CLAW_TOOL_SHELL_DEFAULT_MAX_COMMAND);
@@ -371,27 +638,44 @@ static int shell_tool_invoke(const char *json_args, claw_response_t *resp)
     size_t captured = 0;
     struct pollfd pfd;
     struct timespec start, now;
+    int use_argv = 0;
+    const char *mode_note = NULL;
 
     if (!json_args || !resp) return -1;
     if (!env_bool_or_default("CLAW_TOOL_SHELL_ENABLE", 1)) {
-        claw_response_append(resp, "tool_shell disabled by CLAW_TOOL_SHELL_ENABLE=0");
+        (void)claw_response_append(resp, "tool_shell disabled by CLAW_TOOL_SHELL_ENABLE=0");
         return -20;
     }
-    if (json_get_string(json_args, "command", command, sizeof(command)) != 0 || command[0] == '\0') {
-        claw_response_append(resp, "missing command");
-        return -2;
+
+    if (json_get_env_object(json_args, "env", env_items, CLAW_TOOL_SHELL_MAX_ENV, &env_count) != 0) env_count = 0;
+
+    if (json_get_string_array(json_args, "argv", argv_items, CLAW_TOOL_SHELL_MAX_ARGV, &argv_count) == 0 && argv_count > 0) {
+        size_t i;
+        use_argv = 1;
+        for (i = 0; i < argv_count; ++i) argv_exec[i] = argv_items[i];
+        argv_exec[argv_count] = NULL;
+        if (enforce_program_policy(argv_exec[0], resp) != 0) return -15;
+        mode_note = "mode=argv";
+    } else {
+        if (json_get_string(json_args, "command", command, sizeof(command)) != 0 || command[0] == '\0') {
+            (void)claw_response_append(resp, "missing command or argv");
+            return -2;
+        }
+        if ((long)strlen(command) > max_command) {
+            (void)claw_response_append(resp, "command exceeds max length policy");
+            return -3;
+        }
+        if (enforce_command_policy(command, resp) != 0) return -15;
+        mode_note = "mode=command";
     }
-    if ((long)strlen(command) > max_command) {
-        claw_response_append(resp, "command exceeds max length policy");
-        return -3;
-    }
+
     if (json_get_string(json_args, "cwd", cwd_input, sizeof(cwd_input)) != 0) cwd_input[0] = '\0';
     if (resolve_realpath_or_cwd(cwd_input, cwd_real) != 0) {
-        claw_response_append(resp, "invalid cwd");
+        (void)claw_response_append(resp, "invalid cwd");
         return -4;
     }
     if (!cwd_allowed(cwd_real)) {
-        claw_response_append(resp, "cwd rejected by allowed-roots policy");
+        (void)claw_response_append(resp, "cwd rejected by allowed-roots policy");
         return -5;
     }
 
@@ -402,69 +686,52 @@ static int shell_tool_invoke(const char *json_args, claw_response_t *resp)
     }
     if (max_output < 1024) max_output = CLAW_TOOL_SHELL_DEFAULT_MAX_OUTPUT;
 
-    if (pipe(pipefd) != 0) {
-        claw_response_append(resp, "pipe failed");
-        return -6;
-    }
+    if (pipe(pipefd) != 0) { (void)claw_response_append(resp, "pipe failed"); return -6; }
     if (set_cloexec(pipefd[0]) != 0 || set_cloexec(pipefd[1]) != 0 || set_nonblock(pipefd[0]) != 0) {
-        claw_response_append(resp, "pipe setup failed");
-        close(pipefd[0]);
-        close(pipefd[1]);
+        (void)claw_response_append(resp, "pipe setup failed");
+        close(pipefd[0]); close(pipefd[1]);
         return -7;
     }
 
     devnull = open("/dev/null", O_RDONLY | O_CLOEXEC);
     if (devnull < 0) {
-        claw_response_append(resp, "open /dev/null failed");
-        close(pipefd[0]);
-        close(pipefd[1]);
+        (void)claw_response_append(resp, "open /dev/null failed");
+        close(pipefd[0]); close(pipefd[1]);
         return -8;
     }
 
     pid = fork();
     if (pid < 0) {
-        claw_response_append(resp, "fork failed");
-        close(devnull);
-        close(pipefd[0]);
-        close(pipefd[1]);
+        (void)claw_response_append(resp, "fork failed");
+        close(devnull); close(pipefd[0]); close(pipefd[1]);
         return -9;
     }
 
     if (pid == 0) {
-        char *const argv[] = {"sh", "-lc", command, NULL};
-        char path_env[] = "PATH=/usr/bin:/bin";
-        char lang_env[] = "LANG=C";
-        char home_env[PATH_MAX + 6];
-        char pwd_env[PATH_MAX + 5];
-        char *envp[5];
-        int envc = 0;
+        char *const sh_argv[] = {"sh", "-lc", command, NULL};
+        char env_keys[CLAW_TOOL_SHELL_MAX_ENV + 8][CLAW_TOOL_SHELL_ENV_KEY_CAP];
+        char env_storage[CLAW_TOOL_SHELL_MAX_ENV + 8][CLAW_TOOL_SHELL_ENV_VAL_CAP];
+        char *envp[CLAW_TOOL_SHELL_MAX_ENV + 9];
         int maxfd;
+        int fd;
 
         (void)setsid();
         umask(077);
         child_apply_limits();
-
         if (chdir(cwd_real) != 0) _exit(126);
         if (dup2(devnull, STDIN_FILENO) < 0) _exit(126);
         if (dup2(pipefd[1], STDOUT_FILENO) < 0) _exit(126);
         if (dup2(pipefd[1], STDERR_FILENO) < 0) _exit(126);
-        close(devnull);
-        close(pipefd[0]);
-        close(pipefd[1]);
+        close(devnull); close(pipefd[0]); close(pipefd[1]);
 
         maxfd = (int)sysconf(_SC_OPEN_MAX);
         if (maxfd < 16) maxfd = 256;
-        for (int fd = 3; fd < maxfd; ++fd) close(fd);
+        for (fd = 3; fd < maxfd; ++fd) close(fd);
 
-        snprintf(home_env, sizeof(home_env), "HOME=%s", cwd_real);
-        snprintf(pwd_env, sizeof(pwd_env), "PWD=%s", cwd_real);
-        envp[envc++] = path_env;
-        envp[envc++] = lang_env;
-        envp[envc++] = home_env;
-        envp[envc++] = pwd_env;
-        envp[envc] = NULL;
+        if (build_envp(cwd_real, env_items, env_count, env_keys, env_storage, envp) != 0) _exit(126);
 
-        execve("/bin/sh", argv, envp);
+        if (use_argv) execvpe(argv_exec[0], argv_exec, envp);
+        execve("/bin/sh", sh_argv, envp);
         _exit(127);
     }
 
@@ -485,29 +752,27 @@ static int shell_tool_invoke(const char *json_args, claw_response_t *resp)
             long remaining = timeout_ms - elapsed;
             if (remaining <= 0) {
                 timed_out = 1;
-                kill(-pid, SIGKILL);
-                kill(pid, SIGKILL);
+                (void)kill(-pid, SIGKILL);
+                (void)kill(pid, SIGKILL);
                 timeout_ms = 0;
                 wait_ms = 50;
             } else {
                 wait_ms = remaining > 200 ? 200 : (int)remaining;
             }
         }
-
         prc = poll(&pfd, 1, wait_ms);
         if (prc > 0 && (pfd.revents & (POLLIN | POLLHUP | POLLERR))) {
             if (drain_pipe_limited(pipefd[0], resp, &captured, (size_t)max_output, &eof, &truncated) != 0) {
                 close(pipefd[0]);
-                kill(-pid, SIGKILL);
-                kill(pid, SIGKILL);
-                waitpid(pid, NULL, 0);
-                claw_response_append(resp, "\n[pipe read failed]");
+                (void)kill(-pid, SIGKILL);
+                (void)kill(pid, SIGKILL);
+                (void)waitpid(pid, NULL, 0);
+                (void)claw_response_append(resp, "\n[pipe read failed]");
                 return -10;
             }
             if (truncated) {
-                kill(-pid, SIGKILL);
-                kill(pid, SIGKILL);
-                timed_out = timed_out || 0;
+                (void)kill(-pid, SIGKILL);
+                (void)kill(pid, SIGKILL);
             }
         }
         if (!child_done) {
@@ -517,28 +782,37 @@ static int shell_tool_invoke(const char *json_args, claw_response_t *resp)
     }
 
     close(pipefd[0]);
-    if (!child_done) waitpid(pid, &status, 0);
+    if (!child_done) (void)waitpid(pid, &status, 0);
 
-    if (truncated) append_note(resp, "truncated_output");
+    if (mode_note) (void)append_note(resp, mode_note);
+    if (truncated) (void)append_note(resp, "truncated_output");
     if (timed_out) {
-        append_note(resp, "timed_out");
+        (void)append_note(resp, "timed_out");
         return -11;
     }
     if (WIFEXITED(status)) {
         int exit_code = WEXITSTATUS(status);
-        append_status_line(resp, "exit_code=", exit_code);
+        (void)append_status_line(resp, "exit_code=", exit_code);
         return exit_code == 0 ? 0 : -12;
     }
     if (WIFSIGNALED(status)) {
-        append_status_line(resp, "signal=", WTERMSIG(status));
+        (void)append_status_line(resp, "signal=", WTERMSIG(status));
         return -13;
     }
-    claw_response_append(resp, "\n[unknown_status]");
+    (void)claw_response_append(resp, "\n[unknown_status]");
     return -14;
 }
 
+
+static const char TOOL_REQUEST_SCHEMA[] = "{\"type\":\"object\",\"properties\":{\"command\":{\"type\":\"string\"},\"argv\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}},\"cwd\":{\"type\":\"string\"},\"timeout_ms\":{\"type\":\"integer\"}}}";
+static const char TOOL_RESPONSE_SCHEMA[] = "{\"type\":\"object\",\"properties\":{\"ok\":{\"type\":\"boolean\"},\"tool\":{\"const\":\"shell\"}}}";
+
 static const claw_tool_api_t SHELL_TOOL = {
     .name = "shell",
+    .abi_name = "claw.tool.shell",
+    .abi_version = 1u,
+    .request_schema_json = TOOL_REQUEST_SCHEMA,
+    .response_schema_json = TOOL_RESPONSE_SCHEMA,
     .invoke = shell_tool_invoke,
 };
 

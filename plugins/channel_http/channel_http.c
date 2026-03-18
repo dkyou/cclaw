@@ -1,5 +1,6 @@
 #define _GNU_SOURCE
 #include "claw/plugin_api.h"
+#include "claw/tool_types.h"
 
 #include <arpa/inet.h>
 #include <errno.h>
@@ -13,7 +14,9 @@
 #include <sys/epoll.h>
 #include <sys/signalfd.h>
 #include <sys/socket.h>
+#include <sys/timerfd.h>
 #include <sys/types.h>
+#include <time.h>
 #include <unistd.h>
 
 #define CLAW_HTTP_DEFAULT_BIND "127.0.0.1"
@@ -26,7 +29,8 @@
 enum source_type {
     SRC_LISTENER = 1,
     SRC_SIGNAL   = 2,
-    SRC_CLIENT   = 3
+    SRC_CLIENT   = 3,
+    SRC_TIMER    = 4
 };
 
 typedef struct {
@@ -88,8 +92,10 @@ static int send_response_build(char *out, size_t out_cap, int code, const char *
     switch (code) {
     case 200: reason = "OK"; break;
     case 400: reason = "Bad Request"; break;
+    case 403: reason = "Forbidden"; break;
     case 404: reason = "Not Found"; break;
     case 405: reason = "Method Not Allowed"; break;
+    case 408: reason = "Request Timeout"; break;
     case 413: reason = "Payload Too Large"; break;
     case 500: reason = "Internal Server Error"; break;
     default: break;
@@ -264,6 +270,66 @@ static int json_get_long(const char *json, const char *field, long *value_out)
     return 0;
 }
 
+static int path_starts_with(const char *path, const char *prefix)
+{
+    size_t n;
+    if (!path || !prefix) return 0;
+    n = strlen(prefix);
+    return strncmp(path, prefix, n) == 0;
+}
+
+static int query_get_long(const char *path, const char *key, long *value_out)
+{
+    char needle[64];
+    const char *q;
+    char *end = NULL;
+    long v;
+    size_t needle_len;
+    if (!path || !key || !value_out) return -1;
+    q = strchr(path, '?');
+    if (!q) return -2;
+    ++q;
+    if (snprintf(needle, sizeof(needle), "%s=", key) >= (int)sizeof(needle)) return -3;
+    needle_len = strlen(needle);
+    while (*q) {
+        if (strncmp(q, needle, needle_len) == 0) {
+            q += needle_len;
+            v = strtol(q, &end, 10);
+            if (q == end) return -4;
+            *value_out = v;
+            return 0;
+        }
+        q = strchr(q, '&');
+        if (!q) break;
+        ++q;
+    }
+    return -5;
+}
+static int query_get_string(const char *path, const char *key, char *out, size_t out_cap)
+{
+    char needle[64];
+    const char *p, *start;
+    size_t len = 0;
+    if (!path || !key || !out || out_cap == 0) return -1;
+    if (snprintf(needle, sizeof(needle), "%s=", key) >= (int)sizeof(needle)) return -1;
+    p = strchr(path, '?');
+    if (!p) return -2;
+    ++p;
+    while (*p) {
+        if (strncmp(p, needle, strlen(needle)) == 0) {
+            start = p + strlen(needle);
+            while (start[len] && start[len] != '&') ++len;
+            if (len + 1 > out_cap) return -3;
+            memcpy(out, start, len);
+            out[len] = '\0';
+            return 0;
+        }
+        p = strchr(p, '&');
+        if (!p) break;
+        ++p;
+    }
+    return -4;
+}
 static int append_json_escaped(claw_response_t *resp, const char *s)
 {
     const unsigned char *p;
@@ -305,7 +371,7 @@ static int append_json_escaped(claw_response_t *resp, const char *s)
     return 0;
 }
 
-static int build_shell_json_args(const char *body, char *out, size_t out_cap)
+static __attribute__((unused)) int build_shell_json_args(const char *body, char *out, size_t out_cap)
 {
     char command[4096];
     char cwd[1024];
@@ -314,6 +380,11 @@ static int build_shell_json_args(const char *body, char *out, size_t out_cap)
     int have_cwd = 0;
     int have_timeout = 0;
 
+    if (!body || !out || out_cap == 0) return -1;
+    if (strstr(body, "\"argv\"") || strstr(body, "\"env\"")) {
+        if (snprintf(out, out_cap, "%s", body) >= (int)out_cap) return -2;
+        return 0;
+    }
     if (json_get_string(body, "command", command, sizeof(command)) != 0) return -1;
     if (json_get_string(body, "cwd", cwd, sizeof(cwd)) == 0) have_cwd = 1;
     if (json_get_long(body, "timeout_ms", &timeout_ms) == 0) have_timeout = 1;
@@ -337,6 +408,19 @@ static int build_shell_json_args(const char *body, char *out, size_t out_cap)
     return 0;
 }
 
+static __attribute__((unused)) int build_passthrough_json_args(const char *body, char *out, size_t out_cap, const char *required_field)
+{
+    if (!body || !out || out_cap == 0) return -1;
+    if (required_field && *required_field) {
+        char needle[64];
+        if (snprintf(needle, sizeof(needle), "\"%s\"", required_field) <= 0) return -1;
+        if (!strstr(body, needle)) return -2;
+    }
+    if (snprintf(out, out_cap, "%s", body) >= (int)out_cap) return -3;
+    return 0;
+}
+
+
 static int handle_request(const claw_host_api_t *host, const char *method, const char *path, const char *body,
     char *resp_buf, size_t resp_cap, int *status, const char **content_type)
 {
@@ -356,6 +440,60 @@ static int handle_request(const claw_host_api_t *host, const char *method, const
     if (strcmp(method, "GET") == 0 && strcmp(path, "/v1/list") == 0) {
         *content_type = "application/json; charset=utf-8";
         return host->list_modules(&resp);
+    }
+    if (strcmp(method, "GET") == 0 && (strcmp(path, "/v1/tools/schemas") == 0 || strcmp(path, "/v1/tools/docs") == 0)) {
+        *content_type = "application/json; charset=utf-8";
+        return host->tool_schemas ? host->tool_schemas(&resp) : claw_response_append(&resp, "[]");
+    }
+    if (strcmp(method, "GET") == 0 && (path_starts_with(path, "/v1/tools/schema") || path_starts_with(path, "/v1/tools/doc"))) {
+        char name[128];
+        *content_type = "application/json; charset=utf-8";
+        if (query_get_string(path, "name", name, sizeof(name)) != 0 || name[0] == '\0') {
+            *status = 400;
+            return claw_response_append(&resp, "{\"ok\":false,\"error\":\"missing tool name\"}");
+        }
+        rc = host->tool_schema_get ? host->tool_schema_get(name, &resp) : -1;
+        if (rc != 0) {
+            *status = 404;
+            if (resp.len == 0) return claw_response_append(&resp, "{\"ok\":false,\"error\":\"tool schema not found\"}");
+        }
+        return 0;
+    }
+    if (strcmp(method, "GET") == 0 && (strcmp(path, "/openapi.json") == 0 || strcmp(path, "/v1/openapi.json") == 0)) {
+        *content_type = "application/json; charset=utf-8";
+        return host->openapi_json ? host->openapi_json(&resp) : claw_response_append(&resp, "{}");
+    }
+    if (strcmp(method, "GET") == 0 && strcmp(path, "/v1/metrics") == 0) {
+        *content_type = "application/json; charset=utf-8";
+        return host->metrics_json ? host->metrics_json(&resp) : claw_response_append(&resp, "{}");
+    }
+    if (strcmp(method, "GET") == 0 && strcmp(path, "/metrics") == 0) {
+        *content_type = "text/plain; version=0.0.4; charset=utf-8";
+        return host->metrics_prometheus ? host->metrics_prometheus(&resp) : claw_response_append(&resp, "");
+    }
+    if (strcmp(method, "GET") == 0 && strcmp(path, "/v1/scheduler/status") == 0) {
+        *content_type = "application/json; charset=utf-8";
+        return host->scheduler_status ? host->scheduler_status(&resp) : claw_response_append(&resp, "{}");
+    }
+    if (strcmp(method, "GET") == 0 && strcmp(path, "/v1/scheduler/tasks") == 0) {
+        *content_type = "application/json; charset=utf-8";
+        return host->scheduler_tasks_json ? host->scheduler_tasks_json(&resp) : claw_response_append(&resp, "[]");
+    }
+    if (strcmp(method, "GET") == 0 && path_starts_with(path, "/v1/scheduler/task")) {
+        long id = 0;
+        *content_type = "application/json; charset=utf-8";
+        if (query_get_long(path, "id", &id) != 0 || id <= 0) {
+            *status = 400;
+            *content_type = "text/plain; charset=utf-8";
+            return claw_response_append(&resp, "missing valid id");
+        }
+        rc = host->scheduler_task_get_json ? host->scheduler_task_get_json(id, &resp) : -1;
+        if (rc != 0) {
+            *status = 404;
+            *content_type = "text/plain; charset=utf-8";
+            if (resp.len == 0) return claw_response_append(&resp, "scheduler task not found");
+        }
+        return 0;
     }
 
     if (strcmp(method, "POST") != 0) {
@@ -398,6 +536,7 @@ static int handle_request(const claw_host_api_t *host, const char *method, const
             json_get_string(body, "key", key, sizeof(key)) != 0 ||
             json_get_string(body, "value", value, sizeof(value)) != 0) {
             *status = 400;
+            *content_type = "text/plain; charset=utf-8";
             return claw_response_append(&resp, "missing memory, key, or value");
         }
         rc = host->memory_put(memory, key, value);
@@ -428,6 +567,18 @@ static int handle_request(const claw_host_api_t *host, const char *method, const
         return 0;
     }
 
+    if (strcmp(path, "/v1/tools/validate") == 0) {
+        *content_type = "application/json; charset=utf-8";
+        if (json_get_string(body, "tool", tool, sizeof(tool)) != 0) {
+            *status = 400;
+            return claw_response_append(&resp, "{\"ok\":false,\"error\":\"missing tool\"}");
+        }
+        snprintf(json_args, sizeof(json_args), "%s", body ? body : "{}");
+        rc = host->tool_validate ? host->tool_validate(tool, json_args, &resp) : -1;
+        *status = claw_tt_http_status_from_json(resp.buf);
+        return 0;
+    }
+
     if (strcmp(path, "/v1/tool/invoke") == 0) {
         if (json_get_string(body, "tool", tool, sizeof(tool)) != 0 ||
             json_get_string(body, "json_args", json_args, sizeof(json_args)) != 0) {
@@ -443,16 +594,130 @@ static int handle_request(const claw_host_api_t *host, const char *method, const
     }
 
     if (strcmp(path, "/v1/tool/shell") == 0) {
-        if (build_shell_json_args(body, json_args, sizeof(json_args)) != 0) {
-            *status = 400;
-            return claw_response_append(&resp, "missing command or invalid tool body");
-        }
+        *content_type = "application/json; charset=utf-8";
+        snprintf(json_args, sizeof(json_args), "%s", body ? body : "{}");
         rc = host->tool_invoke("shell", json_args, &resp);
+        *status = claw_tt_http_status_from_json(resp.buf);
+        return 0;
+    }
+
+    if (strcmp(path, "/v1/tools/exec") == 0) {
+        *content_type = "application/json; charset=utf-8";
+        if (!body || !strstr(body, "\"argv\"")) {
+            *status = 400;
+            return claw_response_append(&resp, "{\"ok\":false,\"tool\":\"exec\",\"error\":{\"code\":\"schema_validation\",\"field\":\"argv\",\"message\":\"argv is required\"}}");
+        }
+        snprintf(json_args, sizeof(json_args), "%s", body);
+        rc = host->tool_invoke("exec", json_args, &resp);
+        *status = claw_tt_http_status_from_json(resp.buf);
+        return 0;
+    }
+
+    if (strcmp(path, "/v1/fs/read") == 0) {
+        *content_type = "application/json; charset=utf-8";
+        if (!body || !strstr(body, "\"path\"")) {
+            *status = 400;
+            return claw_response_append(&resp, "{\"ok\":false,\"tool\":\"fs.read\",\"error\":{\"code\":\"schema_validation\",\"field\":\"path\",\"message\":\"path is required\"}}");
+        }
+        snprintf(json_args, sizeof(json_args), "%s", body);
+        rc = host->tool_invoke("fs.read", json_args, &resp);
+        *status = claw_tt_http_status_from_json(resp.buf);
+        return 0;
+    }
+
+    if (strcmp(path, "/v1/fs/write") == 0) {
+        if (build_passthrough_json_args(body, json_args, sizeof(json_args), "path") != 0 || !strstr(body, "\"content\"")) {
+            *status = 400;
+            return claw_response_append(&resp, "missing path/content or invalid fs.write body");
+        }
+        rc = host->tool_invoke("fs.write", json_args, &resp);
         if (rc != 0) {
             *status = 500;
-            if (resp.len == 0) return claw_response_append(&resp, "shell tool failed");
+            if (resp.len == 0) return claw_response_append(&resp, "fs.write failed");
         }
         return 0;
+    }
+
+    if (strcmp(path, "/v1/fs/list") == 0) {
+        *content_type = "application/json; charset=utf-8";
+        snprintf(json_args, sizeof(json_args), "%s", body ? body : "{}");
+        rc = host->tool_invoke("fs.list", json_args, &resp);
+        *status = claw_tt_http_status_from_json(resp.buf);
+        return 0;
+    }
+
+    if (strcmp(path, "/v1/scheduler/task/upsert") == 0) {
+        long id = 0, enabled = 1, paused = 0, interval_sec = 0, run_at_unix = 0, delay_sec = 0;
+        char schedule_type[32], kind[64], target2[128], arg1_2[4096], arg2_2[4096], cron_expr[128], timezone[64];
+        if (json_get_long(body, "id", &id) != 0) id = 0;
+        if (json_get_long(body, "enabled", &enabled) != 0) enabled = 1;
+        if (json_get_long(body, "paused", &paused) != 0) paused = 0;
+        if (json_get_string(body, "schedule_type", schedule_type, sizeof(schedule_type)) != 0) snprintf(schedule_type, sizeof(schedule_type), "interval");
+        if (json_get_string(body, "kind", kind, sizeof(kind)) != 0 ||
+            json_get_string(body, "target", target2, sizeof(target2)) != 0 ||
+            json_get_string(body, "arg1", arg1_2, sizeof(arg1_2)) != 0) {
+            *status = 400;
+            return claw_response_append(&resp, "missing kind, target, or arg1");
+        }
+        if (json_get_long(body, "interval_sec", &interval_sec) != 0) interval_sec = 0;
+        if (json_get_long(body, "run_at_unix", &run_at_unix) != 0) run_at_unix = 0;
+        if (json_get_long(body, "delay_sec", &delay_sec) == 0 && delay_sec > 0) run_at_unix = time(NULL) + delay_sec;
+        if (json_get_string(body, "cron_expr", cron_expr, sizeof(cron_expr)) != 0) cron_expr[0] = '\0';
+        if (json_get_string(body, "timezone", timezone, sizeof(timezone)) != 0) timezone[0] = '\0';
+        if (json_get_string(body, "arg2", arg2_2, sizeof(arg2_2)) != 0) arg2_2[0] = '\0';
+        rc = host->scheduler_task_upsert ? host->scheduler_task_upsert(id, (int)enabled, (int)paused, schedule_type,
+            (int)interval_sec, run_at_unix, cron_expr, timezone, kind, target2, arg1_2, arg2_2) : -1;
+        if (rc != 0) {
+            *status = 500;
+            return claw_response_append(&resp, "scheduler task upsert failed");
+        }
+        *content_type = "application/json; charset=utf-8";
+        return claw_response_append(&resp, "{\"ok\":true}");
+    }
+
+    if (strcmp(path, "/v1/scheduler/task/delete") == 0) {
+        long id = 0;
+        if (json_get_long(body, "id", &id) != 0 || id <= 0) {
+            *status = 400;
+            return claw_response_append(&resp, "missing valid id");
+        }
+        rc = host->scheduler_task_delete ? host->scheduler_task_delete(id) : -1;
+        if (rc != 0) {
+            *status = 500;
+            return claw_response_append(&resp, "scheduler task delete failed");
+        }
+        *content_type = "application/json; charset=utf-8";
+        return claw_response_append(&resp, "{\"ok\":true}");
+    }
+
+    if (strcmp(path, "/v1/scheduler/task/enable") == 0 || strcmp(path, "/v1/scheduler/task/disable") == 0) {
+        long id = 0;
+        if (json_get_long(body, "id", &id) != 0 || id <= 0) {
+            *status = 400;
+            return claw_response_append(&resp, "missing valid id");
+        }
+        rc = host->scheduler_task_set_enabled ? host->scheduler_task_set_enabled(id, strcmp(path, "/v1/scheduler/task/enable") == 0 ? 1 : 0) : -1;
+        if (rc != 0) {
+            *status = 500;
+            return claw_response_append(&resp, "scheduler task enable/disable failed");
+        }
+        *content_type = "application/json; charset=utf-8";
+        return claw_response_append(&resp, "{\"ok\":true}");
+    }
+
+    if (strcmp(path, "/v1/scheduler/task/pause") == 0 || strcmp(path, "/v1/scheduler/task/resume") == 0) {
+        long id = 0;
+        if (json_get_long(body, "id", &id) != 0 || id <= 0) {
+            *status = 400;
+            return claw_response_append(&resp, "missing valid id");
+        }
+        rc = host->scheduler_task_set_paused ? host->scheduler_task_set_paused(id, strcmp(path, "/v1/scheduler/task/pause") == 0 ? 1 : 0) : -1;
+        if (rc != 0) {
+            *status = 500;
+            return claw_response_append(&resp, "scheduler task pause/resume failed");
+        }
+        *content_type = "application/json; charset=utf-8";
+        return claw_response_append(&resp, "{\"ok\":true}");
     }
 
     *status = 404;
@@ -654,6 +919,7 @@ static int http_channel_serve(const claw_host_api_t *host)
     int server_fd = -1;
     int epfd = -1;
     int signal_fd = -1;
+    int timer_fd = -1;
     int client_count = 0;
     int max_clients = env_int_or_default("CLAW_HTTP_MAX_CLIENTS", CLAW_HTTP_DEFAULT_MAX_CLIENTS);
     struct sockaddr_in addr;
@@ -662,6 +928,7 @@ static int http_channel_serve(const claw_host_api_t *host)
     sigset_t mask;
     event_source_t listener_src = { SRC_LISTENER, -1 };
     event_source_t signal_src = { SRC_SIGNAL, -1 };
+    event_source_t timer_src = { SRC_TIMER, -1 };
 
     if (!host) return -1;
 
@@ -702,9 +969,28 @@ static int http_channel_serve(const claw_host_api_t *host)
         close(server_fd);
         return -7;
     }
+    timer_fd = timerfd_create(CLOCK_MONOTONIC, TFD_NONBLOCK | TFD_CLOEXEC);
+    if (timer_fd < 0) {
+        close(signal_fd);
+        close(server_fd);
+        return -7;
+    }
+    {
+        struct itimerspec its;
+        memset(&its, 0, sizeof(its));
+        its.it_value.tv_sec = 1;
+        its.it_interval.tv_sec = 1;
+        if (timerfd_settime(timer_fd, 0, &its, NULL) != 0) {
+            close(timer_fd);
+            close(signal_fd);
+            close(server_fd);
+            return -7;
+        }
+    }
 
     epfd = epoll_create1(EPOLL_CLOEXEC);
     if (epfd < 0) {
+        close(timer_fd);
         close(signal_fd);
         close(server_fd);
         return -8;
@@ -712,6 +998,7 @@ static int http_channel_serve(const claw_host_api_t *host)
 
     listener_src.fd = server_fd;
     signal_src.fd = signal_fd;
+    timer_src.fd = timer_fd;
     {
         struct epoll_event ev;
         memset(&ev, 0, sizeof(ev));
@@ -722,9 +1009,13 @@ static int http_channel_serve(const claw_host_api_t *host)
         ev.events = EPOLLIN;
         ev.data.ptr = &signal_src;
         if (epoll_ctl(epfd, EPOLL_CTL_ADD, signal_fd, &ev) != 0) goto fail;
+        memset(&ev, 0, sizeof(ev));
+        ev.events = EPOLLIN;
+        ev.data.ptr = &timer_src;
+        if (epoll_ctl(epfd, EPOLL_CTL_ADD, timer_fd, &ev) != 0) goto fail;
     }
 
-    fprintf(stderr, "http channel(epoll) listening on http://%s:%d\n", bind_ip, port);
+    fprintf(stderr, "http runtime(epoll+scheduler) listening on http://%s:%d\n", bind_ip, port);
     while (!g_stop) {
         struct epoll_event events[CLAW_HTTP_MAX_EVENTS];
         int n = epoll_wait(epfd, events, CLAW_HTTP_MAX_EVENTS, -1);
@@ -741,6 +1032,12 @@ static int http_channel_serve(const claw_host_api_t *host)
                 while (read(signal_fd, &si, sizeof(si)) == (ssize_t)sizeof(si)) {
                     g_stop = 1;
                 }
+                continue;
+            }
+            if (src->type == SRC_TIMER) {
+                uint64_t expirations = 0;
+                while (read(timer_fd, &expirations, sizeof(expirations)) == (ssize_t)sizeof(expirations)) { }
+                if (host->scheduler_tick) (void)host->scheduler_tick();
                 continue;
             }
             if (src->type == SRC_LISTENER) {
@@ -776,12 +1073,14 @@ static int http_channel_serve(const claw_host_api_t *host)
     }
 
     close(epfd);
+    close(timer_fd);
     close(signal_fd);
     close(server_fd);
     return 0;
 
 fail:
     if (epfd >= 0) close(epfd);
+    if (timer_fd >= 0) close(timer_fd);
     if (signal_fd >= 0) close(signal_fd);
     if (server_fd >= 0) close(server_fd);
     return -9;

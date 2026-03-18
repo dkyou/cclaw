@@ -5,7 +5,7 @@
 #include <stdint.h>
 #include <string.h>
 
-#define CLAW_PLUGIN_ABI_VERSION 4u
+#define CLAW_PLUGIN_ABI_VERSION 16u
 #define CLAW_NAME_MAX 64
 
 typedef enum {
@@ -67,6 +67,10 @@ typedef struct {
 
 typedef struct {
     const char *name;
+    const char *abi_name;
+    uint32_t abi_version;
+    const char *request_schema_json;
+    const char *response_schema_json;
     int (*invoke)(const char *json_args, claw_response_t *resp);
 } claw_tool_api_t;
 
@@ -77,6 +81,22 @@ typedef struct claw_host_api {
     int (*memory_get)(const char *memory, const char *key, claw_response_t *resp);
     int (*memory_search)(const char *memory, const char *query, claw_response_t *resp);
     int (*tool_invoke)(const char *tool, const char *json_args, claw_response_t *resp);
+    int (*tool_schemas)(claw_response_t *resp);
+    int (*tool_schema_get)(const char *tool, claw_response_t *resp);
+    int (*tool_validate)(const char *tool, const char *json_args, claw_response_t *resp);
+    int (*openapi_json)(claw_response_t *resp);
+    int (*metrics_json)(claw_response_t *resp);
+    int (*metrics_prometheus)(claw_response_t *resp);
+    int (*scheduler_status)(claw_response_t *resp);
+    int (*scheduler_tasks_json)(claw_response_t *resp);
+    int (*scheduler_task_get_json)(long id, claw_response_t *resp);
+    int (*scheduler_tick)(void);
+    int (*scheduler_task_upsert)(long id, int enabled, int paused, const char *schedule_type,
+        int interval_sec, long run_at_unix, const char *cron_expr, const char *timezone,
+        const char *kind, const char *target, const char *arg1, const char *arg2);
+    int (*scheduler_task_delete)(long id);
+    int (*scheduler_task_set_enabled)(long id, int enabled);
+    int (*scheduler_task_set_paused)(long id, int paused);
 } claw_host_api_t;
 
 typedef struct {
