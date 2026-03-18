@@ -330,6 +330,140 @@ static int query_get_string(const char *path, const char *key, char *out, size_t
     }
     return -4;
 }
+
+static const char *skip_json_value_end(const char *p)
+{
+    int depth_obj = 0, depth_arr = 0, in_str = 0, esc = 0;
+    if (!p) return NULL;
+    if (*p == '"') {
+        ++p;
+        while (*p) {
+            if (esc) esc = 0;
+            else if (*p == '\\') esc = 1;
+            else if (*p == '"') return p + 1;
+            ++p;
+        }
+        return NULL;
+    }
+    if (*p == '{' || *p == '[') {
+        depth_obj = *p == '{' ? 1 : 0;
+        depth_arr = *p == '[' ? 1 : 0;
+        ++p;
+        while (*p) {
+            if (in_str) {
+                if (esc) esc = 0;
+                else if (*p == '\\') esc = 1;
+                else if (*p == '"') in_str = 0;
+                ++p;
+                continue;
+            }
+            if (*p == '"') {
+                in_str = 1;
+                ++p;
+                continue;
+            }
+            if (*p == '{') depth_obj++;
+            else if (*p == '}') {
+                if (--depth_obj == 0 && depth_arr == 0) return p + 1;
+            } else if (*p == '[') depth_arr++;
+            else if (*p == ']') {
+                if (--depth_arr == 0 && depth_obj == 0) return p + 1;
+            }
+            ++p;
+        }
+        return NULL;
+    }
+    while (*p && *p != ',' && *p != '}' && *p != ']' &&
+           *p != ' ' && *p != '\t' && *p != '\r' && *p != '\n')
+        ++p;
+    return p;
+}
+
+static int json_get_top_level_field_raw(const char *json, const char *field,
+    char *out, size_t out_cap)
+{
+    char key[128];
+    const char *p;
+    const char *value_start, *value_end;
+    if (!json || !field || !out || out_cap == 0) return -1;
+    if (snprintf(key, sizeof(key), "\"%s\"", field) >= (int)sizeof(key)) return -1;
+    p = strstr(json, key);
+    if (!p) return -2;
+    p = strchr(p, ':');
+    if (!p) return -3;
+    value_start = skip_ws(p + 1);
+    value_end = skip_json_value_end(value_start);
+    if (!value_end || value_end < value_start) return -4;
+    if ((size_t)(value_end - value_start) + 1 > out_cap) return -5;
+    memcpy(out, value_start, (size_t)(value_end - value_start));
+    out[value_end - value_start] = '\0';
+    return 0;
+}
+
+static int json_copy_without_top_level_field(const char *json, const char *field,
+    char *out, size_t out_cap)
+{
+    const char *p;
+    claw_response_t resp;
+    int first = 1;
+    if (!json || !field || !out || out_cap == 0) return -1;
+    p = skip_ws(json);
+    if (!p || *p != '{') return -2;
+    ++p;
+    claw_response_init(&resp, out, out_cap);
+    if (claw_response_append(&resp, "{") != 0) return -3;
+    while (*p) {
+        const char *name_start, *name_end, *value_start, *value_end;
+        size_t name_len;
+        p = skip_ws(p);
+        if (*p == '}') break;
+        if (*p == ',') {
+            ++p;
+            continue;
+        }
+        if (*p != '"') return -4;
+        name_start = ++p;
+        while (*p) {
+            if (*p == '\\' && p[1]) {
+                p += 2;
+                continue;
+            }
+            if (*p == '"') break;
+            ++p;
+        }
+        if (*p != '"') return -5;
+        name_end = p++;
+        p = skip_ws(p);
+        if (*p != ':') return -6;
+        value_start = skip_ws(p + 1);
+        value_end = skip_json_value_end(value_start);
+        if (!value_end) return -7;
+        name_len = (size_t)(name_end - name_start);
+        if (!(strlen(field) == name_len && strncmp(name_start, field, name_len) == 0)) {
+            if (!first && claw_response_append(&resp, ",") != 0) return -8;
+            if (claw_response_append_mem(&resp, "\"", 1) != 0 ||
+                claw_response_append_mem(&resp, name_start, name_len) != 0 ||
+                claw_response_append(&resp, "\":") != 0 ||
+                claw_response_append_mem(&resp, value_start,
+                    (size_t)(value_end - value_start)) != 0) return -8;
+            first = 0;
+        }
+        p = value_end;
+        p = skip_ws(p);
+        if (*p == ',') ++p;
+    }
+    if (claw_response_append(&resp, "}") != 0) return -9;
+    return 0;
+}
+
+static int build_tool_validate_json_args(const char *body, char *out, size_t out_cap)
+{
+    if (!body || !out || out_cap == 0) return -1;
+    if (json_get_top_level_field_raw(body, "args", out, out_cap) == 0) return 0;
+    if (json_get_string(body, "json_args", out, out_cap) == 0) return 0;
+    return json_copy_without_top_level_field(body, "tool", out, out_cap);
+}
+
 static int append_json_escaped(claw_response_t *resp, const char *s)
 {
     const unsigned char *p;
@@ -459,6 +593,24 @@ static int handle_request(const claw_host_api_t *host, const char *method, const
         }
         return 0;
     }
+    if (strcmp(method, "GET") == 0 && strcmp(path, "/v1/runtime/schemas") == 0) {
+        *content_type = "application/json; charset=utf-8";
+        return host->runtime_schemas ? host->runtime_schemas(&resp) : claw_response_append(&resp, "[]");
+    }
+    if (strcmp(method, "GET") == 0 && path_starts_with(path, "/v1/runtime/schema")) {
+        char name[128];
+        *content_type = "application/json; charset=utf-8";
+        if (query_get_string(path, "name", name, sizeof(name)) != 0 || name[0] == '\0') {
+            *status = 400;
+            return claw_response_append(&resp, "{\"ok\":false,\"error\":\"missing runtime schema name\"}");
+        }
+        rc = host->runtime_schema_get ? host->runtime_schema_get(name, &resp) : -1;
+        if (rc != 0) {
+            *status = 404;
+            if (resp.len == 0) return claw_response_append(&resp, "{\"ok\":false,\"error\":\"runtime schema not found\"}");
+        }
+        return 0;
+    }
     if (strcmp(method, "GET") == 0 && (strcmp(path, "/openapi.json") == 0 || strcmp(path, "/v1/openapi.json") == 0)) {
         *content_type = "application/json; charset=utf-8";
         return host->openapi_json ? host->openapi_json(&resp) : claw_response_append(&resp, "{}");
@@ -573,9 +725,19 @@ static int handle_request(const claw_host_api_t *host, const char *method, const
             *status = 400;
             return claw_response_append(&resp, "{\"ok\":false,\"error\":\"missing tool\"}");
         }
-        snprintf(json_args, sizeof(json_args), "%s", body ? body : "{}");
+        if (build_tool_validate_json_args(body, json_args, sizeof(json_args)) != 0) {
+            *status = 400;
+            return claw_response_append(&resp, "{\"ok\":false,\"error\":\"invalid validation request body\"}");
+        }
         rc = host->tool_validate ? host->tool_validate(tool, json_args, &resp) : -1;
+        if (rc != 0 && resp.len == 0) {
+            *status = rc == -2 ? 404 : 500;
+            return claw_response_append(&resp, rc == -2 ?
+                "{\"ok\":false,\"error\":\"tool not found\"}" :
+                "{\"ok\":false,\"error\":\"tool validation failed\"}");
+        }
         *status = claw_tt_http_status_from_json(resp.buf);
+        if (*status == 500 && rc == -2) *status = 404;
         return 0;
     }
 

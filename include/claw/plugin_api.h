@@ -84,6 +84,8 @@ typedef struct claw_host_api {
     int (*tool_schemas)(claw_response_t *resp);
     int (*tool_schema_get)(const char *tool, claw_response_t *resp);
     int (*tool_validate)(const char *tool, const char *json_args, claw_response_t *resp);
+    int (*runtime_schemas)(claw_response_t *resp);
+    int (*runtime_schema_get)(const char *name, claw_response_t *resp);
     int (*openapi_json)(claw_response_t *resp);
     int (*metrics_json)(claw_response_t *resp);
     int (*metrics_prometheus)(claw_response_t *resp);

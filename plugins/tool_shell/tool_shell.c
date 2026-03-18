@@ -804,7 +804,7 @@ static int shell_tool_invoke(const char *json_args, claw_response_t *resp)
 }
 
 
-static const char TOOL_REQUEST_SCHEMA[] = "{\"type\":\"object\",\"properties\":{\"command\":{\"type\":\"string\"},\"argv\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}},\"cwd\":{\"type\":\"string\"},\"timeout_ms\":{\"type\":\"integer\"}}}";
+static const char TOOL_REQUEST_SCHEMA[] = "{\"type\":\"object\",\"additionalProperties\":false,\"properties\":{\"command\":{\"type\":\"string\"},\"argv\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}},\"cwd\":{\"type\":\"string\"},\"timeout_ms\":{\"type\":\"integer\",\"minimum\":1,\"maximum\":30000},\"env\":{\"type\":\"object\",\"additionalProperties\":{\"type\":\"string\"}}}}";
 static const char TOOL_RESPONSE_SCHEMA[] = "{\"type\":\"object\",\"properties\":{\"ok\":{\"type\":\"boolean\"},\"tool\":{\"const\":\"shell\"}}}";
 
 static const claw_tool_api_t SHELL_TOOL = {
