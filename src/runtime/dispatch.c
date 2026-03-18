@@ -266,12 +266,42 @@ static const claw_runtime_route_doc_t RUNTIME_ROUTE_DOCS[] = {
      "\"tools\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}},"
      "\"tool_schemas\":{\"type\":\"array\"},\"runtime_schemas\":{\"type\":\"array\"},"
      "\"openapi\":{\"type\":\"object\"},\"channels\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}}}}"},
+    {"run.create", "POST", "/v1/runs",
+     "Create and execute a run for chat, tool invocation, or scheduler inspection.",
+     "{\"type\":\"object\",\"required\":[\"op\"],\"properties\":{\"op\":{\"type\":\"string\","
+     "\"enum\":[\"chat\",\"tool.invoke\",\"scheduler.status\",\"scheduler.tasks\"]},"
+     "\"provider\":{\"type\":\"string\"},\"message\":{\"type\":\"string\"},"
+     "\"tool\":{\"type\":\"string\"},\"args\":{\"type\":\"object\"},\"json_args\":{\"type\":\"string\"}}}",
+     "{\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"integer\"},\"op\":{\"type\":\"string\"},"
+     "\"status\":{\"type\":\"string\"},\"target\":{\"type\":\"string\"},\"http_status\":{\"type\":\"integer\"},"
+     "\"created_at_unix\":{\"type\":\"integer\"},\"finished_at_unix\":{\"type\":\"integer\"},"
+     "\"result\":{}}}"},
+    {"run.get", "GET", "/v1/runs?id={id}",
+     "Fetch a previously executed run envelope by id.",
+     NULL,
+     "{\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"integer\"},\"op\":{\"type\":\"string\"},"
+     "\"status\":{\"type\":\"string\"},\"target\":{\"type\":\"string\"},\"http_status\":{\"type\":\"integer\"},"
+     "\"created_at_unix\":{\"type\":\"integer\"},\"finished_at_unix\":{\"type\":\"integer\"},"
+     "\"result\":{}}}"},
+    {"run.stream", "POST", "/v1/runs/stream",
+     "Execute a run and return a unified event stream payload in SSE format.",
+     "{\"type\":\"object\",\"required\":[\"op\"],\"properties\":{\"op\":{\"type\":\"string\","
+     "\"enum\":[\"chat\",\"tool.invoke\",\"scheduler.status\",\"scheduler.tasks\"]},"
+     "\"provider\":{\"type\":\"string\"},\"message\":{\"type\":\"string\"},"
+     "\"tool\":{\"type\":\"string\"},\"args\":{\"type\":\"object\"},\"json_args\":{\"type\":\"string\"}}}",
+     "{\"type\":\"string\"}"},
     {"tool.validate", "POST", "/v1/tools/validate",
      "Validate a tool request body without invoking the tool. Accepts tool + args/json_args or tool + raw fields.",
      "{\"type\":\"object\",\"required\":[\"tool\"],\"properties\":{\"tool\":{\"type\":\"string\"},"
      "\"args\":{\"type\":\"object\"},\"json_args\":{\"type\":\"string\"}}}",
      "{\"type\":\"object\",\"properties\":{\"ok\":{\"type\":\"boolean\"},\"tool\":{\"type\":\"string\"},"
      "\"validation\":{\"type\":\"string\"},\"error\":{\"type\":\"object\"}}}"},
+    {"tool.invoke", "POST", "/v1/tools/invoke",
+     "Invoke a tool with structured args/json_args or legacy raw fields.",
+     "{\"type\":\"object\",\"required\":[\"tool\"],\"properties\":{\"tool\":{\"type\":\"string\"},"
+     "\"args\":{\"type\":\"object\"},\"json_args\":{\"type\":\"string\"}}}",
+     "{\"type\":\"object\",\"properties\":{\"ok\":{\"type\":\"boolean\"},\"tool\":{\"type\":\"string\"},"
+     "\"request\":{\"type\":\"object\"},\"result\":{\"type\":\"object\"},\"error\":{\"type\":\"object\"}}}"},
     {"chat", "POST", "/v1/chat", "Send a chat request to a loaded provider.",
      "{\"type\":\"object\",\"additionalProperties\":false,\"required\":[\"provider\",\"message\"],"
      "\"properties\":{\"provider\":{\"type\":\"string\"},\"message\":{\"type\":\"string\"}}}",

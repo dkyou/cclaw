@@ -13,6 +13,7 @@
 #include <strings.h>
 #include <sys/epoll.h>
 #include <sys/signalfd.h>
+#include <sys/stat.h>
 #include <sys/socket.h>
 #include <sys/timerfd.h>
 #include <sys/types.h>
@@ -25,20 +26,30 @@
 #define CLAW_HTTP_MAX_RESP 65536
 #define CLAW_HTTP_MAX_EVENTS 64
 #define CLAW_HTTP_DEFAULT_MAX_CLIENTS 64
+#define CLAW_HTTP_MAX_RUNS 64
 
 enum source_type {
     SRC_LISTENER = 1,
     SRC_SIGNAL   = 2,
     SRC_CLIENT   = 3,
-    SRC_TIMER    = 4
+    SRC_TIMER    = 4,
+    SRC_STREAM   = 5
 };
+
+typedef struct http_client http_client_t;
 
 typedef struct {
     int type;
     int fd;
 } event_source_t;
 
-typedef struct {
+typedef struct stream_source {
+    int type;
+    int fd;
+    http_client_t *client;
+} stream_source_t;
+
+struct http_client {
     int type;
     int fd;
     size_t req_len;
@@ -49,9 +60,29 @@ typedef struct {
     char sendbuf[CLAW_HTTP_MAX_RESP + 1024];
     size_t send_len;
     size_t send_off;
-} http_client_t;
+    int streaming;
+    int stream_eof;
+    int stream_fd;
+    stream_source_t *stream_src;
+};
 
 static volatile sig_atomic_t g_stop = 0;
+
+typedef struct {
+    int used;
+    long id;
+    long created_at_unix;
+    long finished_at_unix;
+    int http_status;
+    char op[64];
+    char status[32];
+    char target[128];
+    char result[8192];
+    int result_is_json;
+} http_run_t;
+
+static http_run_t g_runs[CLAW_HTTP_MAX_RUNS];
+static long g_next_run_id = 1;
 
 static const char *env_or_default(const char *name, const char *fallback)
 {
@@ -456,12 +487,226 @@ static int json_copy_without_top_level_field(const char *json, const char *field
     return 0;
 }
 
-static int build_tool_validate_json_args(const char *body, char *out, size_t out_cap)
+static int build_structured_tool_json_args(const char *body, char *out, size_t out_cap)
 {
     if (!body || !out || out_cap == 0) return -1;
     if (json_get_top_level_field_raw(body, "args", out, out_cap) == 0) return 0;
     if (json_get_string(body, "json_args", out, out_cap) == 0) return 0;
     return json_copy_without_top_level_field(body, "tool", out, out_cap);
+}
+
+static int append_json_escaped(claw_response_t *resp, const char *s);
+static int append_run_json(claw_response_t *resp, const http_run_t *run);
+
+static int body_looks_like_json(const char *body)
+{
+    body = skip_ws(body);
+    return body && (*body == '{' || *body == '[');
+}
+
+static http_run_t *run_alloc_slot(void)
+{
+    size_t i;
+    http_run_t *slot = NULL;
+    for (i = 0; i < CLAW_HTTP_MAX_RUNS; ++i) {
+        if (!g_runs[i].used) {
+            slot = &g_runs[i];
+            break;
+        }
+    }
+    if (!slot) slot = &g_runs[0];
+    memset(slot, 0, sizeof(*slot));
+    slot->used = 1;
+    slot->id = g_next_run_id++;
+    slot->created_at_unix = (long)time(NULL);
+    snprintf(slot->status, sizeof(slot->status), "running");
+    return slot;
+}
+
+static http_run_t *run_find(long id)
+{
+    size_t i;
+    for (i = 0; i < CLAW_HTTP_MAX_RUNS; ++i) {
+        if (g_runs[i].used && g_runs[i].id == id) return &g_runs[i];
+    }
+    return NULL;
+}
+
+static int run_store_result(http_run_t *run, int http_status, const char *result_body)
+{
+    if (!run) return -1;
+    run->finished_at_unix = (long)time(NULL);
+    run->http_status = http_status;
+    snprintf(run->status, sizeof(run->status), http_status >= 400 ? "failed" : "completed");
+    if (!result_body) result_body = "";
+    run->result_is_json = body_looks_like_json(result_body);
+    if (snprintf(run->result, sizeof(run->result), "%s", result_body) >= (int)sizeof(run->result))
+        return -1;
+    return 0;
+}
+
+static int ensure_dir_recursive(const char *path)
+{
+    char tmp[PATH_MAX];
+    char *p;
+    if (!path) return -1;
+    if (snprintf(tmp, sizeof(tmp), "%s", path) >= (int)sizeof(tmp)) return -1;
+    for (p = tmp + 1; *p; ++p) {
+        if (*p == '/') {
+            *p = '\0';
+            if (mkdir(tmp, 0777) != 0 && errno != EEXIST) return -1;
+            *p = '/';
+        }
+    }
+    if (mkdir(tmp, 0777) != 0 && errno != EEXIST) return -1;
+    return 0;
+}
+
+static int runs_dir_path(char *out, size_t out_cap)
+{
+    const char *dir = env_or_default("CLAW_RUNS_DIR", "./state/runs");
+    if (!out || out_cap == 0) return -1;
+    if (snprintf(out, out_cap, "%s", dir) >= (int)out_cap) return -1;
+    return 0;
+}
+
+static int run_file_path(long id, char *out, size_t out_cap)
+{
+    char dir[PATH_MAX];
+    if (runs_dir_path(dir, sizeof(dir)) != 0) return -1;
+    if (ensure_dir_recursive(dir) != 0) return -1;
+    if (!out || out_cap == 0) return -1;
+    if (snprintf(out, out_cap, "%s/run-%ld.json", dir, id) >= (int)out_cap) return -1;
+    return 0;
+}
+
+static int persist_run_file(const http_run_t *run)
+{
+    char path[PATH_MAX];
+    char buf[CLAW_HTTP_MAX_RESP];
+    claw_response_t resp;
+    FILE *fp;
+    if (!run) return -1;
+    if (run_file_path(run->id, path, sizeof(path)) != 0) return -1;
+    claw_response_init(&resp, buf, sizeof(buf));
+    if (append_run_json(&resp, run) != 0) return -1;
+    fp = fopen(path, "wb");
+    if (!fp) return -1;
+    if (fwrite(buf, 1, resp.len, fp) != resp.len) {
+        fclose(fp);
+        return -1;
+    }
+    fclose(fp);
+    return 0;
+}
+
+static int append_persisted_run_json(claw_response_t *resp, long id)
+{
+    char path[PATH_MAX];
+    FILE *fp;
+    size_t n;
+    char buf[2048];
+    if (!resp) return -1;
+    if (run_file_path(id, path, sizeof(path)) != 0) return -1;
+    fp = fopen(path, "rb");
+    if (!fp) return -1;
+    while ((n = fread(buf, 1, sizeof(buf), fp)) > 0) {
+        if (claw_response_append_mem(resp, buf, n) != 0) {
+            fclose(fp);
+            return -1;
+        }
+    }
+    fclose(fp);
+    return resp->len > 0 ? 0 : -1;
+}
+
+static int append_run_json(claw_response_t *resp, const http_run_t *run)
+{
+    char tmp[256];
+    if (!resp || !run) return -1;
+    if (snprintf(tmp, sizeof(tmp),
+        "{\"id\":%ld,\"op\":\"%s\",\"status\":\"%s\",\"target\":\"",
+        run->id, run->op, run->status) < 0) return -1;
+    if (claw_response_append(resp, tmp) != 0) return -1;
+    if (append_json_escaped(resp, run->target) != 0) return -1;
+    if (snprintf(tmp, sizeof(tmp),
+        "\",\"http_status\":%d,\"created_at_unix\":%ld,\"finished_at_unix\":%ld,\"result\":",
+        run->http_status, run->created_at_unix, run->finished_at_unix) < 0) return -1;
+    if (claw_response_append(resp, tmp) != 0) return -1;
+    if (run->result_is_json && run->result[0]) {
+        if (claw_response_append(resp, run->result) != 0) return -1;
+    } else {
+        if (claw_response_append(resp, "\"") != 0) return -1;
+        if (append_json_escaped(resp, run->result) != 0) return -1;
+        if (claw_response_append(resp, "\"") != 0) return -1;
+    }
+    return claw_response_append(resp, "}");
+}
+
+static int append_sse_event(claw_response_t *resp, const char *event_name, const char *data_json)
+{
+    if (!resp || !event_name || !data_json) return -1;
+    if (claw_response_append(resp, "event: ") != 0) return -1;
+    if (claw_response_append(resp, event_name) != 0) return -1;
+    if (claw_response_append(resp, "\ndata: ") != 0) return -1;
+    if (claw_response_append(resp, data_json) != 0) return -1;
+    return claw_response_append(resp, "\n\n");
+}
+
+static int execute_run_request(const claw_host_api_t *host, const char *body,
+    http_run_t *run, char *result_buf, size_t result_cap, int *http_status_out)
+{
+    char op[64];
+    claw_response_t result;
+    int rc = 0;
+    int http_status = 200;
+    if (!host || !body || !run || !result_buf || result_cap == 0 || !http_status_out) return -1;
+    if (json_get_string(body, "op", op, sizeof(op)) != 0) return -2;
+    claw_response_init(&result, result_buf, result_cap);
+    snprintf(run->op, sizeof(run->op), "%s", op);
+    if (strcmp(op, "chat") == 0) {
+        char provider[128], message[4096];
+        if (json_get_string(body, "provider", provider, sizeof(provider)) != 0 ||
+            json_get_string(body, "message", message, sizeof(message)) != 0) return -3;
+        snprintf(run->target, sizeof(run->target), "%s", provider);
+        rc = host->chat ? host->chat(provider, message, &result) : -1;
+        if (rc != 0 && result.len == 0) {
+            http_status = 500;
+            claw_response_append(&result, "chat failed");
+        }
+    } else if (strcmp(op, "tool.invoke") == 0) {
+        char tool[128], json_args[8192];
+        if (json_get_string(body, "tool", tool, sizeof(tool)) != 0) return -4;
+        if (build_structured_tool_json_args(body, json_args, sizeof(json_args)) != 0) return -5;
+        snprintf(run->target, sizeof(run->target), "%s", tool);
+        rc = host->tool_invoke ? host->tool_invoke(tool, json_args, &result) : -1;
+        if (rc != 0 && result.len == 0) {
+            http_status = rc == -2 ? 404 : 500;
+            claw_response_append(&result, rc == -2 ? "{\"ok\":false,\"error\":\"tool not found\"}" :
+                "{\"ok\":false,\"error\":\"tool invoke failed\"}");
+        } else {
+            http_status = claw_tt_http_status_from_json(result.buf);
+            if (http_status == 500 && rc == -2) http_status = 404;
+        }
+    } else if (strcmp(op, "scheduler.status") == 0) {
+        snprintf(run->target, sizeof(run->target), "scheduler");
+        rc = host->scheduler_status ? host->scheduler_status(&result) : -1;
+        if (rc != 0 && result.len == 0) {
+            http_status = 500;
+            claw_response_append(&result, "{\"ok\":false,\"error\":\"scheduler status failed\"}");
+        }
+    } else if (strcmp(op, "scheduler.tasks") == 0) {
+        snprintf(run->target, sizeof(run->target), "scheduler");
+        rc = host->scheduler_tasks_json ? host->scheduler_tasks_json(&result) : -1;
+        if (rc != 0 && result.len == 0) {
+            http_status = 500;
+            claw_response_append(&result, "{\"ok\":false,\"error\":\"scheduler tasks failed\"}");
+        }
+    } else {
+        return -6;
+    }
+    *http_status_out = http_status;
+    return 0;
 }
 
 static int append_json_escaped(claw_response_t *resp, const char *s)
@@ -575,6 +820,22 @@ static int handle_request(const claw_host_api_t *host, const char *method, const
         *content_type = "application/json; charset=utf-8";
         return host->list_modules(&resp);
     }
+    if (strcmp(method, "GET") == 0 && path_starts_with(path, "/v1/runs")) {
+        long id = 0;
+        http_run_t *run;
+        *content_type = "application/json; charset=utf-8";
+        if (query_get_long(path, "id", &id) != 0 || id <= 0) {
+            *status = 400;
+            return claw_response_append(&resp, "{\"ok\":false,\"error\":\"missing run id\"}");
+        }
+        if (append_persisted_run_json(&resp, id) == 0) return 0;
+        run = run_find(id);
+        if (!run) {
+            *status = 404;
+            return claw_response_append(&resp, "{\"ok\":false,\"error\":\"run not found\"}");
+        }
+        return append_run_json(&resp, run);
+    }
     if (strcmp(method, "GET") == 0 && (strcmp(path, "/v1/tools/schemas") == 0 || strcmp(path, "/v1/tools/docs") == 0)) {
         *content_type = "application/json; charset=utf-8";
         return host->tool_schemas ? host->tool_schemas(&resp) : claw_response_append(&resp, "[]");
@@ -654,6 +915,46 @@ static int handle_request(const claw_host_api_t *host, const char *method, const
     }
     if (!body) body = "{}";
 
+    if (strcmp(path, "/v1/runs") == 0 || strcmp(path, "/v1/runs/stream") == 0) {
+        http_run_t *run = run_alloc_slot();
+        char run_result[CLAW_HTTP_MAX_RESP];
+        char event_json[1024];
+        char output_json[CLAW_HTTP_MAX_RESP];
+        if (!run) {
+            *status = 500;
+            return claw_response_append(&resp, "{\"ok\":false,\"error\":\"run allocation failed\"}");
+        }
+        if (execute_run_request(host, body, run, run_result, sizeof(run_result), status) != 0) {
+            *status = 400;
+            return claw_response_append(&resp, "{\"ok\":false,\"error\":\"invalid run request\"}");
+        }
+        if (run_store_result(run, *status, run_result) != 0) {
+            *status = 500;
+            return claw_response_append(&resp, "{\"ok\":false,\"error\":\"run persistence failed\"}");
+        }
+        if (persist_run_file(run) != 0) {
+            *status = 500;
+            return claw_response_append(&resp, "{\"ok\":false,\"error\":\"run file persistence failed\"}");
+        }
+        if (strcmp(path, "/v1/runs/stream") == 0) {
+            claw_response_t out_resp;
+            *content_type = "text/event-stream; charset=utf-8";
+            if (snprintf(event_json, sizeof(event_json),
+                "{\"id\":%ld,\"op\":\"%s\",\"status\":\"running\"}",
+                run->id, run->op) < 0) return -1;
+            if (append_sse_event(&resp, "run.started", event_json) != 0) return -1;
+            claw_response_init(&out_resp, output_json, sizeof(output_json));
+            if (append_run_json(&out_resp, run) != 0) return -1;
+            if (append_sse_event(&resp, "run.output", output_json) != 0) return -1;
+            if (snprintf(event_json, sizeof(event_json),
+                "{\"id\":%ld,\"status\":\"%s\",\"http_status\":%d}",
+                run->id, run->status, run->http_status) < 0) return -1;
+            return append_sse_event(&resp, "run.completed", event_json);
+        }
+        *content_type = "application/json; charset=utf-8";
+        return append_run_json(&resp, run);
+    }
+
     if (strcmp(path, "/v1/chat") == 0) {
         if (json_get_string(body, "provider", provider, sizeof(provider)) != 0 ||
             json_get_string(body, "message", message, sizeof(message)) != 0) {
@@ -725,7 +1026,7 @@ static int handle_request(const claw_host_api_t *host, const char *method, const
             *status = 400;
             return claw_response_append(&resp, "{\"ok\":false,\"error\":\"missing tool\"}");
         }
-        if (build_tool_validate_json_args(body, json_args, sizeof(json_args)) != 0) {
+        if (build_structured_tool_json_args(body, json_args, sizeof(json_args)) != 0) {
             *status = 400;
             return claw_response_append(&resp, "{\"ok\":false,\"error\":\"invalid validation request body\"}");
         }
@@ -741,17 +1042,25 @@ static int handle_request(const claw_host_api_t *host, const char *method, const
         return 0;
     }
 
-    if (strcmp(path, "/v1/tool/invoke") == 0) {
-        if (json_get_string(body, "tool", tool, sizeof(tool)) != 0 ||
-            json_get_string(body, "json_args", json_args, sizeof(json_args)) != 0) {
+    if (strcmp(path, "/v1/tools/invoke") == 0 || strcmp(path, "/v1/tool/invoke") == 0) {
+        *content_type = "application/json; charset=utf-8";
+        if (json_get_string(body, "tool", tool, sizeof(tool)) != 0) {
             *status = 400;
-            return claw_response_append(&resp, "missing tool or json_args");
+            return claw_response_append(&resp, "{\"ok\":false,\"error\":\"missing tool\"}");
+        }
+        if (build_structured_tool_json_args(body, json_args, sizeof(json_args)) != 0) {
+            *status = 400;
+            return claw_response_append(&resp, "{\"ok\":false,\"error\":\"invalid tool invoke body\"}");
         }
         rc = host->tool_invoke(tool, json_args, &resp);
-        if (rc != 0) {
-            *status = 500;
-            if (resp.len == 0) return claw_response_append(&resp, "tool invoke failed");
+        if (rc != 0 && resp.len == 0) {
+            *status = rc == -2 ? 404 : 500;
+            return claw_response_append(&resp, rc == -2 ?
+                "{\"ok\":false,\"error\":\"tool not found\"}" :
+                "{\"ok\":false,\"error\":\"tool invoke failed\"}");
         }
+        *status = claw_tt_http_status_from_json(resp.buf);
+        if (*status == 500 && rc == -2) *status = 404;
         return 0;
     }
 
@@ -889,12 +1198,115 @@ static int handle_request(const claw_host_api_t *host, const char *method, const
 static void client_close(int epfd, http_client_t *c)
 {
     if (!c) return;
+    if (c->stream_src) {
+        if (c->stream_src->fd >= 0) {
+            epoll_ctl(epfd, EPOLL_CTL_DEL, c->stream_src->fd, NULL);
+            close(c->stream_src->fd);
+        }
+        free(c->stream_src);
+        c->stream_src = NULL;
+    } else if (c->stream_fd >= 0) {
+        close(c->stream_fd);
+        c->stream_fd = -1;
+    }
     if (c->fd >= 0) {
         epoll_ctl(epfd, EPOLL_CTL_DEL, c->fd, NULL);
         close(c->fd);
         c->fd = -1;
     }
     free(c);
+}
+
+static int client_update_events(int epfd, http_client_t *c, int want_out)
+{
+    struct epoll_event ev;
+    if (!c) return -1;
+    memset(&ev, 0, sizeof(ev));
+    ev.events = EPOLLRDHUP | EPOLLHUP | EPOLLERR | (want_out ? EPOLLOUT : 0);
+    if (!c->streaming) ev.events |= EPOLLIN;
+    ev.data.ptr = c;
+    return epoll_ctl(epfd, EPOLL_CTL_MOD, c->fd, &ev);
+}
+
+static int stream_prepare_headers(http_client_t *c)
+{
+    int n;
+    if (!c) return -1;
+    n = snprintf(c->sendbuf, sizeof(c->sendbuf),
+        "HTTP/1.1 200 OK\r\n"
+        "Content-Type: text/event-stream; charset=utf-8\r\n"
+        "Cache-Control: no-cache\r\n"
+        "Connection: close\r\n\r\n");
+    if (n < 0 || (size_t)n >= sizeof(c->sendbuf)) return -1;
+    c->send_len = (size_t)n;
+    c->send_off = 0;
+    return 0;
+}
+
+static int client_begin_run_stream(int epfd, http_client_t *c,
+    const claw_host_api_t *host, const char *req_body)
+{
+    int pipefd[2] = {-1, -1};
+    pid_t pid;
+    http_run_t *run;
+    stream_source_t *src = NULL;
+    if (!c || !host || !req_body) return -1;
+    run = run_alloc_slot();
+    if (!run) return -1;
+    if (pipe2(pipefd, O_NONBLOCK | O_CLOEXEC) != 0) return -1;
+    pid = fork();
+    if (pid < 0) {
+        close(pipefd[0]);
+        close(pipefd[1]);
+        return -1;
+    }
+    if (pid == 0) {
+        char run_result[CLAW_HTTP_MAX_RESP];
+        char event_json[1024];
+        char output_json[CLAW_HTTP_MAX_RESP];
+        claw_response_t out_resp;
+        int http_status = 200;
+        close(pipefd[0]);
+        if (c->fd >= 0) close(c->fd);
+        dprintf(pipefd[1], "event: run.started\ndata: {\"id\":%ld,\"status\":\"running\"}\n\n",
+            run->id);
+        if (execute_run_request(host, req_body, run, run_result, sizeof(run_result), &http_status) != 0) {
+            _exit(1);
+        }
+        if (run_store_result(run, http_status, run_result) != 0) _exit(1);
+        (void)persist_run_file(run);
+        claw_response_init(&out_resp, output_json, sizeof(output_json));
+        if (append_run_json(&out_resp, run) == 0)
+            dprintf(pipefd[1], "event: run.output\ndata: %s\n\n", output_json);
+        snprintf(event_json, sizeof(event_json),
+            "{\"id\":%ld,\"status\":\"%s\",\"http_status\":%d}",
+            run->id, run->status, run->http_status);
+        dprintf(pipefd[1], "event: run.completed\ndata: %s\n\n", event_json);
+        close(pipefd[1]);
+        _exit(0);
+    }
+    close(pipefd[1]);
+    src = (stream_source_t *)calloc(1, sizeof(*src));
+    if (!src) {
+        close(pipefd[0]);
+        return -1;
+    }
+    c->streaming = 1;
+    c->stream_fd = pipefd[0];
+    c->stream_src = src;
+    src->type = SRC_STREAM;
+    src->fd = pipefd[0];
+    src->client = c;
+    if (stream_prepare_headers(c) != 0) return -1;
+    {
+        struct epoll_event ev;
+        memset(&ev, 0, sizeof(ev));
+        ev.events = EPOLLIN | EPOLLHUP | EPOLLERR;
+        ev.data.ptr = src;
+        if (epoll_ctl(epfd, EPOLL_CTL_ADD, src->fd, &ev) != 0) return -1;
+    }
+    if (client_update_events(epfd, c, 1) != 0) return -1;
+    return 0;
 }
 
 static int client_prepare_error(http_client_t *c, int code, const char *msg)
@@ -965,7 +1377,7 @@ static int client_try_parse_request(http_client_t *c, char **method_out, char **
     return 1;
 }
 
-static int client_build_app_response(http_client_t *c, const claw_host_api_t *host)
+static int client_build_app_response(int epfd, http_client_t *c, const claw_host_api_t *host)
 {
     char body[CLAW_HTTP_MAX_RESP];
     char *method = NULL, *path = NULL, *req_body = NULL;
@@ -978,6 +1390,9 @@ static int client_build_app_response(http_client_t *c, const claw_host_api_t *ho
     rc = client_try_parse_request(c, &method, &path, &req_body);
     if (rc <= 0) {
         return client_prepare_error(c, rc == -2 ? 413 : 400, rc == -2 ? "payload too large" : "bad request");
+    }
+    if (strcmp(method, "POST") == 0 && strcmp(path, "/v1/runs/stream") == 0) {
+        return client_begin_run_stream(epfd, c, host, req_body);
     }
     rc = handle_request(host, method, path, req_body, body, sizeof(body), &status, &content_type);
     if (rc != 0 && body[0] == '\0') {
@@ -1019,14 +1434,8 @@ static int client_handle_read(int epfd, http_client_t *c, const claw_host_api_t 
         return -1;
     }
 
-    if (client_build_app_response(c, host) != 0) return -1;
-    {
-        struct epoll_event ev;
-        memset(&ev, 0, sizeof(ev));
-        ev.events = EPOLLOUT | EPOLLRDHUP | EPOLLHUP | EPOLLERR;
-        ev.data.ptr = c;
-        if (epoll_ctl(epfd, EPOLL_CTL_MOD, c->fd, &ev) != 0) return -1;
-    }
+    if (client_build_app_response(epfd, c, host) != 0) return -1;
+    if (client_update_events(epfd, c, 1) != 0) return -1;
     return 0;
 }
 
@@ -1041,6 +1450,12 @@ static int client_handle_write(http_client_t *c)
         if (n < 0 && errno == EINTR) continue;
         if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) return 0;
         return -1;
+    }
+    c->send_len = 0;
+    c->send_off = 0;
+    if (c->streaming) {
+        if (c->stream_eof) return 1;
+        return 0;
     }
     return 1;
 }
@@ -1063,6 +1478,7 @@ static int listener_accept_loop(int epfd, int listen_fd, int max_clients, int *c
         }
         c->type = SRC_CLIENT;
         c->fd = client_fd;
+        c->stream_fd = -1;
         memset(&ev, 0, sizeof(ev));
         ev.events = EPOLLIN | EPOLLRDHUP | EPOLLHUP | EPOLLERR;
         ev.data.ptr = c;
@@ -1122,6 +1538,7 @@ static int http_channel_serve(const claw_host_api_t *host)
     sigemptyset(&mask);
     sigaddset(&mask, SIGINT);
     sigaddset(&mask, SIGTERM);
+    signal(SIGCHLD, SIG_IGN);
     if (sigprocmask(SIG_BLOCK, &mask, NULL) != 0) {
         close(server_fd);
         return -6;
@@ -1229,6 +1646,47 @@ static int http_channel_serve(const claw_host_api_t *host)
                         --client_count;
                         continue;
                     }
+                    if (client_update_events(epfd, c, 0) != 0) {
+                        client_close(epfd, c);
+                        --client_count;
+                        continue;
+                    }
+                }
+                continue;
+            }
+            if (src->type == SRC_STREAM) {
+                stream_source_t *ss = (stream_source_t *)src;
+                http_client_t *c = ss->client;
+                ssize_t m;
+                if (!c) continue;
+                if (c->send_len != 0) continue;
+                m = read(ss->fd, c->sendbuf, sizeof(c->sendbuf));
+                if (m > 0) {
+                    c->send_len = (size_t)m;
+                    c->send_off = 0;
+                    if (client_update_events(epfd, c, 1) != 0) {
+                        client_close(epfd, c);
+                        --client_count;
+                    }
+                    continue;
+                }
+                if (m == 0) {
+                    c->stream_eof = 1;
+                    epoll_ctl(epfd, EPOLL_CTL_DEL, ss->fd, NULL);
+                    close(ss->fd);
+                    ss->fd = -1;
+                    free(ss);
+                    c->stream_src = NULL;
+                    c->stream_fd = -1;
+                    if (c->send_len == 0) {
+                        client_close(epfd, c);
+                        --client_count;
+                    }
+                    continue;
+                }
+                if (m < 0 && !(errno == EAGAIN || errno == EWOULDBLOCK)) {
+                    client_close(epfd, c);
+                    --client_count;
                 }
             }
         }
