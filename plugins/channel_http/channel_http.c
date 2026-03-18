@@ -1544,6 +1544,7 @@ static int http_channel_serve(const claw_host_api_t *host)
     sigemptyset(&mask);
     sigaddset(&mask, SIGINT);
     sigaddset(&mask, SIGTERM);
+    signal(SIGCHLD, SIG_IGN);
     if (sigprocmask(SIG_BLOCK, &mask, NULL) != 0) {
         close(server_fd);
         return -6;
