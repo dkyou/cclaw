@@ -17,6 +17,7 @@
 #include <sys/socket.h>
 #include <sys/timerfd.h>
 #include <sys/types.h>
+#include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -67,6 +68,11 @@ struct http_client {
 };
 
 static volatile sig_atomic_t g_stop = 0;
+
+static void reap_children_nonblocking(void)
+{
+    while (waitpid(-1, NULL, WNOHANG) > 0) { }
+}
 
 typedef struct {
     int used;
@@ -1616,6 +1622,7 @@ static int http_channel_serve(const claw_host_api_t *host)
             if (src->type == SRC_TIMER) {
                 uint64_t expirations = 0;
                 while (read(timer_fd, &expirations, sizeof(expirations)) == (ssize_t)sizeof(expirations)) { }
+                reap_children_nonblocking();
                 if (host->scheduler_tick) (void)host->scheduler_tick();
                 continue;
             }
