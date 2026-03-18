@@ -99,6 +99,13 @@ static int host_tool_validate(const char *tool_name, const char *json_args,
                                                   json_args, resp)
                     : -1;
 }
+static int host_runtime_schemas(claw_response_t *resp) {
+  return g_dispatch ? claw_dispatch_runtime_schemas(g_dispatch, resp) : -1;
+}
+static int host_runtime_schema_get(const char *name, claw_response_t *resp) {
+  return g_dispatch ? claw_dispatch_runtime_schema_get(g_dispatch, name, resp)
+                    : -1;
+}
 static int host_openapi_json(claw_response_t *resp) {
   return g_dispatch ? claw_dispatch_openapi(g_dispatch, resp) : -1;
 }
@@ -170,6 +177,8 @@ static const claw_host_api_t HOST_API = {
     .tool_schemas = host_tool_schemas,
     .tool_schema_get = host_tool_schema_get,
     .tool_validate = host_tool_validate,
+    .runtime_schemas = host_runtime_schemas,
+    .runtime_schema_get = host_runtime_schema_get,
     .openapi_json = host_openapi_json,
     .metrics_json = host_metrics_json,
     .metrics_prometheus = host_metrics_prometheus,
