@@ -146,7 +146,9 @@ static const char *tool_examples_json(const char *tool_name) {
   if (strcmp(tool_name, "shell") == 0)
     return "[{\"title\":\"command\",\"request\":{\"command\":\"printf "
            "hello\",\"cwd\":\".\"}},{\"title\":\"argv\",\"request\":{\"argv\":["
-           "\"printf\",\"hello\"],\"cwd\":\".\"}}]";
+           "\"printf\",\"hello\"],\"cwd\":\".\"}},{\"title\":\"with_env\","
+           "\"request\":{\"argv\":[\"/usr/bin/env\"],\"env\":{\"FOO\":\"BAR\"},"
+           "\"cwd\":\".\"}}]";
   return "[]";
 }
 
@@ -211,6 +213,209 @@ static int append_tool_http_doc(claw_response_t *resp,
   return claw_response_append(resp, "}");
 }
 
+typedef struct {
+  const char *name;
+  const char *method;
+  const char *path;
+  const char *summary;
+  const char *request_schema_json;
+  const char *response_schema_json;
+} claw_runtime_route_doc_t;
+
+static const char *runtime_scheduler_task_schema(void) {
+  return "{\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"integer\"},"
+         "\"enabled\":{\"type\":\"boolean\"},\"paused\":{\"type\":\"boolean\"},"
+         "\"schedule_type\":{\"type\":\"string\"},\"interval_sec\":"
+         "{\"type\":\"integer\"},\"run_at_unix\":{\"type\":\"integer\"},"
+         "\"cron_expr\":{\"type\":\"string\"},\"timezone\":{\"type\":\"string\"},"
+         "\"kind\":{\"type\":\"string\"},\"target\":{\"type\":\"string\"},"
+         "\"arg1\":{\"type\":\"string\"},\"arg2\":{\"type\":\"string\"},"
+         "\"next_due_local\":{\"type\":\"string\"},\"last_run_local\":"
+         "{\"type\":\"string\"},\"created_at_local\":{\"type\":\"string\"},"
+         "\"updated_at_local\":{\"type\":\"string\"},\"next_due_unix\":"
+         "{\"type\":\"integer\"},\"last_run_unix\":{\"type\":\"integer\"},"
+         "\"last_rc\":{\"type\":\"integer\"},\"run_count\":{\"type\":\"integer\"},"
+         "\"created_at\":{\"type\":\"integer\"},\"updated_at\":"
+         "{\"type\":\"integer\"}}}";
+}
+
+static const char *runtime_scheduler_status_schema(void) {
+  return "{\"type\":\"object\",\"properties\":{\"running\":{\"type\":\"boolean\"},"
+         "\"heartbeat_enabled\":{\"type\":\"boolean\"},"
+         "\"heartbeat_interval_sec\":{\"type\":\"integer\"},"
+         "\"heartbeat_last_unix\":{\"type\":\"integer\"},"
+         "\"heartbeat_next_unix\":{\"type\":\"integer\"},"
+         "\"scheduler_now_unix\":{\"type\":\"integer\"},"
+         "\"scheduler_now_local\":{\"type\":\"string\"},"
+         "\"db_path\":{\"type\":\"string\"},\"task_count\":{\"type\":\"integer\"},"
+         "\"enabled_count\":{\"type\":\"integer\"},\"paused_count\":"
+         "{\"type\":\"integer\"},\"oneshot_count\":{\"type\":\"integer\"},"
+         "\"cron_count\":{\"type\":\"integer\"},\"tasks\":{\"type\":\"array\","
+         "\"items\":";
+}
+
+static const claw_runtime_route_doc_t RUNTIME_ROUTE_DOCS[] = {
+    {"health", "GET", "/health", "Health check for the runtime.",
+     NULL,
+     "{\"type\":\"object\",\"properties\":{\"ok\":{\"const\":true}}}"},
+    {"list", "GET", "/v1/list",
+     "Enumerate loaded providers, memories, tools, channels, and self-described runtime schemas.",
+     NULL,
+     "{\"type\":\"object\",\"properties\":{\"providers\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}},"
+     "\"memories\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}},"
+     "\"tools\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}},"
+     "\"tool_schemas\":{\"type\":\"array\"},\"runtime_schemas\":{\"type\":\"array\"},"
+     "\"openapi\":{\"type\":\"object\"},\"channels\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}}}}"},
+    {"tool.validate", "POST", "/v1/tools/validate",
+     "Validate a tool request body without invoking the tool. Accepts tool + args/json_args or tool + raw fields.",
+     "{\"type\":\"object\",\"required\":[\"tool\"],\"properties\":{\"tool\":{\"type\":\"string\"},"
+     "\"args\":{\"type\":\"object\"},\"json_args\":{\"type\":\"string\"}}}",
+     "{\"type\":\"object\",\"properties\":{\"ok\":{\"type\":\"boolean\"},\"tool\":{\"type\":\"string\"},"
+     "\"validation\":{\"type\":\"string\"},\"error\":{\"type\":\"object\"}}}"},
+    {"chat", "POST", "/v1/chat", "Send a chat request to a loaded provider.",
+     "{\"type\":\"object\",\"additionalProperties\":false,\"required\":[\"provider\",\"message\"],"
+     "\"properties\":{\"provider\":{\"type\":\"string\"},\"message\":{\"type\":\"string\"}}}",
+     "{\"type\":\"string\"}"},
+    {"memory.get", "POST", "/v1/memory/get", "Get a value from a memory module.",
+     "{\"type\":\"object\",\"additionalProperties\":false,\"required\":[\"memory\",\"key\"],"
+     "\"properties\":{\"memory\":{\"type\":\"string\"},\"key\":{\"type\":\"string\"}}}",
+     "{}"},
+    {"memory.put", "POST", "/v1/memory/put", "Write a value to a memory module.",
+     "{\"type\":\"object\",\"additionalProperties\":false,\"required\":[\"memory\",\"key\",\"value\"],"
+     "\"properties\":{\"memory\":{\"type\":\"string\"},\"key\":{\"type\":\"string\"},"
+     "\"value\":{\"type\":\"string\"}}}",
+     "{\"type\":\"object\",\"properties\":{\"ok\":{\"type\":\"boolean\"}}}"},
+    {"memory.search", "POST", "/v1/memory/search", "Search a memory module.",
+     "{\"type\":\"object\",\"additionalProperties\":false,\"required\":[\"memory\",\"query\"],"
+     "\"properties\":{\"memory\":{\"type\":\"string\"},\"query\":{\"type\":\"string\"}}}",
+     "{}"},
+    {"metrics.json", "GET", "/v1/metrics", "Fetch runtime metrics as JSON.",
+     NULL, "{\"type\":\"object\"}"},
+    {"metrics.prometheus", "GET", "/metrics", "Fetch runtime metrics in Prometheus exposition format.",
+     NULL, "{\"type\":\"string\"}"},
+    {"scheduler.status", "GET", "/v1/scheduler/status", "Fetch scheduler status and loaded task summary.",
+     NULL, NULL},
+    {"scheduler.tasks", "GET", "/v1/scheduler/tasks", "Fetch all scheduler tasks.",
+     NULL, NULL},
+    {"scheduler.task.get", "GET", "/v1/scheduler/task?id={id}", "Fetch one scheduler task by id.",
+     NULL, NULL},
+    {"scheduler.task.upsert", "POST", "/v1/scheduler/task/upsert", "Create or update a scheduler task.",
+     "{\"type\":\"object\",\"required\":[\"kind\",\"target\",\"arg1\"],\"properties\":{\"id\":{\"type\":\"integer\"},"
+     "\"enabled\":{\"type\":\"integer\"},\"paused\":{\"type\":\"integer\"},\"schedule_type\":{\"type\":\"string\","
+     "\"enum\":[\"interval\",\"oneshot\",\"cron\"]},\"interval_sec\":{\"type\":\"integer\"},"
+     "\"run_at_unix\":{\"type\":\"integer\"},\"delay_sec\":{\"type\":\"integer\"},"
+     "\"cron_expr\":{\"type\":\"string\"},\"timezone\":{\"type\":\"string\"},"
+     "\"kind\":{\"type\":\"string\"},\"target\":{\"type\":\"string\"},\"arg1\":{\"type\":\"string\"},"
+     "\"arg2\":{\"type\":\"string\"}}}",
+     "{\"type\":\"object\",\"properties\":{\"ok\":{\"type\":\"boolean\"}}}"},
+    {"scheduler.task.delete", "POST", "/v1/scheduler/task/delete", "Delete a scheduler task by id.",
+     "{\"type\":\"object\",\"additionalProperties\":false,\"required\":[\"id\"],"
+     "\"properties\":{\"id\":{\"type\":\"integer\",\"minimum\":1}}}",
+     "{\"type\":\"object\",\"properties\":{\"ok\":{\"type\":\"boolean\"}}}"},
+    {"scheduler.task.enable", "POST", "/v1/scheduler/task/enable", "Enable a scheduler task by id.",
+     "{\"type\":\"object\",\"additionalProperties\":false,\"required\":[\"id\"],"
+     "\"properties\":{\"id\":{\"type\":\"integer\",\"minimum\":1}}}",
+     "{\"type\":\"object\",\"properties\":{\"ok\":{\"type\":\"boolean\"}}}"},
+    {"scheduler.task.disable", "POST", "/v1/scheduler/task/disable", "Disable a scheduler task by id.",
+     "{\"type\":\"object\",\"additionalProperties\":false,\"required\":[\"id\"],"
+     "\"properties\":{\"id\":{\"type\":\"integer\",\"minimum\":1}}}",
+     "{\"type\":\"object\",\"properties\":{\"ok\":{\"type\":\"boolean\"}}}"},
+    {"scheduler.task.pause", "POST", "/v1/scheduler/task/pause", "Pause a scheduler task by id.",
+     "{\"type\":\"object\",\"additionalProperties\":false,\"required\":[\"id\"],"
+     "\"properties\":{\"id\":{\"type\":\"integer\",\"minimum\":1}}}",
+     "{\"type\":\"object\",\"properties\":{\"ok\":{\"type\":\"boolean\"}}}"},
+    {"scheduler.task.resume", "POST", "/v1/scheduler/task/resume", "Resume a scheduler task by id.",
+     "{\"type\":\"object\",\"additionalProperties\":false,\"required\":[\"id\"],"
+     "\"properties\":{\"id\":{\"type\":\"integer\",\"minimum\":1}}}",
+     "{\"type\":\"object\",\"properties\":{\"ok\":{\"type\":\"boolean\"}}}"},
+    {"runtime.schemas", "GET", "/v1/runtime/schemas", "List self-described non-tool runtime endpoints.",
+     NULL, "{\"type\":\"array\"}"},
+    {"runtime.schema", "GET", "/v1/runtime/schema?name={name}", "Get one self-described non-tool runtime endpoint by name.",
+     NULL, "{\"type\":\"object\"}"},
+    {"openapi", "GET", "/openapi.json", "Fetch the runtime OpenAPI document.",
+     NULL, "{\"type\":\"object\"}"},
+};
+
+static size_t runtime_route_doc_count(void) {
+  return sizeof(RUNTIME_ROUTE_DOCS) / sizeof(RUNTIME_ROUTE_DOCS[0]);
+}
+
+static const claw_runtime_route_doc_t *find_runtime_route_doc(const char *name) {
+  size_t i;
+  if (!name)
+    return NULL;
+  for (i = 0; i < runtime_route_doc_count(); ++i) {
+    if (strcmp(RUNTIME_ROUTE_DOCS[i].name, name) == 0)
+      return &RUNTIME_ROUTE_DOCS[i];
+  }
+  return NULL;
+}
+
+static int append_runtime_schema_json(claw_response_t *resp,
+                                      const claw_runtime_route_doc_t *doc,
+                                      int request_side) {
+  if (!resp || !doc)
+    return -1;
+  if (request_side) {
+    if (doc->request_schema_json && *doc->request_schema_json)
+      return claw_response_append(resp, doc->request_schema_json);
+  } else if (doc->response_schema_json && *doc->response_schema_json) {
+    return claw_response_append(resp, doc->response_schema_json);
+  }
+  if ((!request_side && strcmp(doc->name, "scheduler.status") == 0) ||
+      (request_side == 0 && strcmp(doc->name, "scheduler.tasks") == 0) ||
+      (request_side == 0 && strcmp(doc->name, "scheduler.task.get") == 0)) {
+    const char *task = runtime_scheduler_task_schema();
+    if (strcmp(doc->name, "scheduler.status") == 0) {
+      if (claw_response_append(resp, runtime_scheduler_status_schema()) != 0)
+        return -1;
+      if (claw_response_append(resp, task) != 0)
+        return -1;
+      return claw_response_append(resp, "}}");
+    }
+    if (strcmp(doc->name, "scheduler.tasks") == 0) {
+      if (claw_response_append(resp, "{\"type\":\"array\",\"items\":") != 0)
+        return -1;
+      if (claw_response_append(resp, task) != 0)
+        return -1;
+      return claw_response_append(resp, "}");
+    }
+    return claw_response_append(resp, task);
+  }
+  return claw_response_append(resp, "null");
+}
+
+static int append_runtime_schema_obj(claw_response_t *resp,
+                                     const claw_runtime_route_doc_t *doc) {
+  if (!resp || !doc)
+    return -1;
+  if (claw_response_append(resp, "{\"name\":") != 0)
+    return -1;
+  if (append_json_quoted(resp, doc->name) != 0)
+    return -1;
+  if (claw_response_append(resp, ",\"http\":{\"method\":") != 0)
+    return -1;
+  if (append_json_quoted(resp, doc->method) != 0)
+    return -1;
+  if (claw_response_append(resp, ",\"path\":") != 0)
+    return -1;
+  if (append_json_quoted(resp, doc->path) != 0)
+    return -1;
+  if (claw_response_append(resp, ",\"help\":") != 0)
+    return -1;
+  if (append_json_quoted(resp, doc->summary) != 0)
+    return -1;
+  if (claw_response_append(resp, "},\"request_schema\":") != 0)
+    return -1;
+  if (append_runtime_schema_json(resp, doc, 1) != 0)
+    return -1;
+  if (claw_response_append(resp, ",\"response_schema\":") != 0)
+    return -1;
+  if (append_runtime_schema_json(resp, doc, 0) != 0)
+    return -1;
+  return claw_response_append(resp, "}");
+}
+
 static int json_has_top_level_field(const char *json, const char *field, char *type_out, size_t type_cap)
 {
     char key[128];
@@ -262,6 +467,135 @@ static int schema_extract_required(const char *schema, char names[][64], size_t 
     return 0;
 }
 
+static int schema_extract_properties(const char *schema, char names[][64],
+    size_t max_names, size_t *count_out)
+{
+    const char *p, *end;
+    size_t n = 0;
+    int depth = 0, in_str = 0, esc = 0;
+    if (count_out) *count_out = 0;
+    if (!schema || !count_out) return -1;
+    p = strstr(schema, "\"properties\":{");
+    if (!p) return 0;
+    p = strchr(p, '{');
+    if (!p) return -1;
+    end = p;
+    for (; *end; ++end) {
+        char c = *end;
+        if (in_str) {
+            if (esc) esc = 0;
+            else if (c == '\\') esc = 1;
+            else if (c == '"') in_str = 0;
+            continue;
+        }
+        if (c == '"') {
+            in_str = 1;
+            continue;
+        }
+        if (c == '{') depth++;
+        else if (c == '}') {
+            depth--;
+            if (depth == 0) break;
+        }
+    }
+    if (*end != '}') return -1;
+    ++p;
+    while (p < end && n < max_names) {
+        const char *q1, *q2, *colon;
+        while (p < end && (*p == ' ' || *p == '\t' || *p == '\r' ||
+            *p == '\n' || *p == ',')) ++p;
+        if (p >= end || *p != '"') break;
+        q1 = p + 1;
+        q2 = q1;
+        while (q2 < end) {
+            if (*q2 == '\\' && q2 + 1 < end) {
+                q2 += 2;
+                continue;
+            }
+            if (*q2 == '"') break;
+            ++q2;
+        }
+        if (q2 >= end) break;
+        colon = q2 + 1;
+        while (colon < end && (*colon == ' ' || *colon == '\t' ||
+            *colon == '\r' || *colon == '\n')) ++colon;
+        if (colon >= end || *colon != ':') break;
+        snprintf(names[n], 64, "%.*s", (int)(q2 - q1), q1);
+        ++n;
+        p = colon + 1;
+        while (p < end && *p && *p != ',') {
+            if (*p == '"') {
+                ++p;
+                while (p < end && *p) {
+                    if (*p == '\\' && p + 1 < end) {
+                        p += 2;
+                        continue;
+                    }
+                    if (*p == '"') {
+                        ++p;
+                        break;
+                    }
+                    ++p;
+                }
+                continue;
+            }
+            if (*p == '{') {
+                int inner = 1;
+                ++p;
+                while (p < end && inner > 0) {
+                    if (*p == '"') {
+                        ++p;
+                        while (p < end && *p) {
+                            if (*p == '\\' && p + 1 < end) {
+                                p += 2;
+                                continue;
+                            }
+                            if (*p == '"') {
+                                ++p;
+                                break;
+                            }
+                            ++p;
+                        }
+                        continue;
+                    }
+                    if (*p == '{') inner++;
+                    else if (*p == '}') inner--;
+                    ++p;
+                }
+                continue;
+            }
+            if (*p == '[') {
+                int inner = 1;
+                ++p;
+                while (p < end && inner > 0) {
+                    if (*p == '"') {
+                        ++p;
+                        while (p < end && *p) {
+                            if (*p == '\\' && p + 1 < end) {
+                                p += 2;
+                                continue;
+                            }
+                            if (*p == '"') {
+                                ++p;
+                                break;
+                            }
+                            ++p;
+                        }
+                        continue;
+                    }
+                    if (*p == '[') inner++;
+                    else if (*p == ']') inner--;
+                    ++p;
+                }
+                continue;
+            }
+            ++p;
+        }
+    }
+    *count_out = n;
+    return 0;
+}
+
 static int schema_extract_property_type(const char *schema, const char *field, char *type_out, size_t cap)
 {
     char pat1[128], pat2[128];
@@ -287,13 +621,14 @@ static int schema_extract_property_type(const char *schema, const char *field, c
 
 static int schema_validate_request(const claw_tool_api_t *tool, const char *json_args, claw_response_t *resp)
 {
-    char req_names[16][64], actual_type[32], expect_type[32];
-    size_t nreq = 0, i;
+    char req_names[16][64], prop_names[32][64], actual_type[32], expect_type[32];
+    size_t nreq = 0, nprops = 0, i;
     const char *schema;
     if (!tool || !json_args || !resp) return -1;
     schema = tool->request_schema_json;
     if (!schema || !*schema) return 0;
     if (schema_extract_required(schema, req_names, 16, &nreq) != 0) return 0;
+    if (schema_extract_properties(schema, prop_names, 32, &nprops) != 0) nprops = 0;
     for (i = 0; i < nreq; ++i) {
         if (!json_has_top_level_field(json_args, req_names[i], NULL, 0)) {
             char msg[160];
@@ -301,13 +636,13 @@ static int schema_validate_request(const claw_tool_api_t *tool, const char *json
             (void)tool_error_json(resp, tool->name, "schema_validation", req_names[i], msg); return -10;
         }
     }
-    for (i = 0; i < nreq; ++i) {
-        if (schema_extract_property_type(schema, req_names[i], expect_type, sizeof(expect_type)) != 0) continue;
-        if (!json_has_top_level_field(json_args, req_names[i], actual_type, sizeof(actual_type))) continue;
+    for (i = 0; i < nprops; ++i) {
+        if (schema_extract_property_type(schema, prop_names[i], expect_type, sizeof(expect_type)) != 0) continue;
+        if (!json_has_top_level_field(json_args, prop_names[i], actual_type, sizeof(actual_type))) continue;
         if (strcmp(expect_type, actual_type) != 0) {
             char msg[192];
             snprintf(msg, sizeof(msg), "field must match declared schema type");
-            (void)tool_error_json(resp, tool->name, "schema_validation", req_names[i], msg); return -10;
+            (void)tool_error_json(resp, tool->name, "schema_validation", prop_names[i], msg); return -10;
         }
     }
     if (strstr(schema, "\"additionalProperties\":false")) {
@@ -464,8 +799,8 @@ static size_t json_count_top_level_array_items(const char *json, const char *fie
 
 static int validate_schema_details(const claw_tool_api_t *tool, const char *json_args, claw_response_t *resp)
 {
-    char req_names[16][64], actual_type[32], expect_type[32], sval[1024], enums[16][64];
-    size_t nreq = 0, i, ec = 0;
+    char prop_names[32][64], actual_type[32], expect_type[32], sval[1024], enums[16][64];
+    size_t nprops = 0, i, ec = 0;
     const char *schema;
     long v, minv, maxv;
     int has_min, has_max, items_string;
@@ -473,30 +808,30 @@ static int validate_schema_details(const claw_tool_api_t *tool, const char *json
     if (!tool || !json_args || !resp) return -1;
     schema = tool->request_schema_json;
     if (!schema || !*schema) return 0;
-    if (schema_extract_required(schema, req_names, 16, &nreq) != 0) return 0;
-    for (i = 0; i < nreq; ++i) {
-        if (schema_extract_property_type(schema, req_names[i], expect_type, sizeof(expect_type)) != 0) continue;
-        if (!json_has_top_level_field(json_args, req_names[i], actual_type, sizeof(actual_type))) continue;
-        if (strcmp(expect_type, "integer") == 0 && claw_tt_json_get_long(json_args, req_names[i], &v) == 0) {
-            schema_extract_int_range(schema, req_names[i], &minv, &has_min, &maxv, &has_max);
-            if (has_min && v < minv) return tool_error_json(resp, tool->name, "schema_validation", req_names[i], "integer below minimum"), -10;
-            if (has_max && v > maxv) return tool_error_json(resp, tool->name, "schema_validation", req_names[i], "integer above maximum"), -10;
-        } else if (strcmp(expect_type, "string") == 0 && claw_tt_json_get_string(json_args, req_names[i], sval, sizeof(sval)) == 0) {
-            if (schema_extract_enum_strings(schema, req_names[i], enums, 16, &ec) == 0 && ec > 0) {
+    if (schema_extract_properties(schema, prop_names, 32, &nprops) != 0) return 0;
+    for (i = 0; i < nprops; ++i) {
+        if (schema_extract_property_type(schema, prop_names[i], expect_type, sizeof(expect_type)) != 0) continue;
+        if (!json_has_top_level_field(json_args, prop_names[i], actual_type, sizeof(actual_type))) continue;
+        if (strcmp(expect_type, "integer") == 0 && claw_tt_json_get_long(json_args, prop_names[i], &v) == 0) {
+            schema_extract_int_range(schema, prop_names[i], &minv, &has_min, &maxv, &has_max);
+            if (has_min && v < minv) return tool_error_json(resp, tool->name, "schema_validation", prop_names[i], "integer below minimum"), -10;
+            if (has_max && v > maxv) return tool_error_json(resp, tool->name, "schema_validation", prop_names[i], "integer above maximum"), -10;
+        } else if (strcmp(expect_type, "string") == 0 && claw_tt_json_get_string(json_args, prop_names[i], sval, sizeof(sval)) == 0) {
+            if (schema_extract_enum_strings(schema, prop_names[i], enums, 16, &ec) == 0 && ec > 0) {
                 size_t j; int found = 0;
                 for (j = 0; j < ec; ++j) if (strcmp(sval, enums[j]) == 0) { found = 1; break; }
-                if (!found) return tool_error_json(resp, tool->name, "schema_validation", req_names[i], "string must be one of enum values"), -10;
+                if (!found) return tool_error_json(resp, tool->name, "schema_validation", prop_names[i], "string must be one of enum values"), -10;
             }
         } else if (strcmp(expect_type, "array") == 0) {
-            schema_extract_array_limits(schema, req_names[i], &minv, &has_min, &maxv, &has_max, &items_string);
-            acount = json_count_top_level_array_items(json_args, req_names[i]);
-            if (has_min && (long)acount < minv) return tool_error_json(resp, tool->name, "schema_validation", req_names[i], "array has fewer than minItems"), -10;
-            if (has_max && (long)acount > maxv) return tool_error_json(resp, tool->name, "schema_validation", req_names[i], "array has more than maxItems"), -10;
+            schema_extract_array_limits(schema, prop_names[i], &minv, &has_min, &maxv, &has_max, &items_string);
+            acount = json_count_top_level_array_items(json_args, prop_names[i]);
+            if (has_min && (long)acount < minv) return tool_error_json(resp, tool->name, "schema_validation", prop_names[i], "array has fewer than minItems"), -10;
+            if (has_max && (long)acount > maxv) return tool_error_json(resp, tool->name, "schema_validation", prop_names[i], "array has more than maxItems"), -10;
             if (items_string && acount > 0) {
                 char items[CLAW_EXEC_MAX_ARGV][CLAW_EXEC_ARG_CAP];
                 size_t count_out = 0;
-                if (claw_tt_json_get_string_array(json_args, req_names[i], items, CLAW_EXEC_MAX_ARGV, &count_out) != 0)
-                    return tool_error_json(resp, tool->name, "schema_validation", req_names[i], "array items must be strings"), -10;
+                if (claw_tt_json_get_string_array(json_args, prop_names[i], items, CLAW_EXEC_MAX_ARGV, &count_out) != 0)
+                    return tool_error_json(resp, tool->name, "schema_validation", prop_names[i], "array items must be strings"), -10;
             }
         }
     }
@@ -506,14 +841,15 @@ static int validate_schema_details(const claw_tool_api_t *tool, const char *json
 static int append_openapi_json(claw_dispatch_t *d, claw_response_t *resp)
 {
     claw_registry_t *r;
-    size_t i;
+    size_t i, route_count;
+    int have_path = 0;
     if (!d || !d->registry || !resp) return -1;
     r = d->registry;
-    if (claw_response_append(resp, "{\"openapi\":\"3.1.0\",\"info\":{\"title\":\"cclaw runtime API\",\"version\":\"16\"},\"paths\":{") != 0) return -1;
+    if (claw_response_append(resp, "{\"openapi\":\"3.1.0\",\"info\":{\"title\":\"cclaw runtime API\",\"version\":\"17\"},\"paths\":{") != 0) return -1;
     for (i = 0; i < r->tool_count; ++i) {
         const claw_tool_api_t *t = r->tools[i];
         char tmp[32];
-        if (i != 0 && claw_response_append(resp, ",") != 0) return -1;
+        if (have_path && claw_response_append(resp, ",") != 0) return -1;
         if (append_json_quoted(resp, tool_http_path(t->name)) != 0) return -1;
         if (claw_response_append(resp, ":{\"post\":{\"summary\":") != 0) return -1;
         if (append_json_quoted(resp, tool_help_text(t->name)) != 0) return -1;
@@ -529,6 +865,28 @@ static int append_openapi_json(claw_dispatch_t *d, claw_response_t *resp)
         if (claw_response_append(resp, ",\"version\":") != 0 || claw_response_append(resp, tmp) != 0) return -1;
         if (claw_response_append(resp, "}}}") != 0) return -1;
         if (claw_response_append(resp, "}") != 0) return -1;
+        have_path = 1;
+    }
+    route_count = runtime_route_doc_count();
+    for (i = 0; i < route_count; ++i) {
+        const claw_runtime_route_doc_t *doc = &RUNTIME_ROUTE_DOCS[i];
+        if (have_path && claw_response_append(resp, ",") != 0) return -1;
+        if (append_json_quoted(resp, doc->path) != 0) return -1;
+        if (claw_response_append(resp, ":{\"") != 0) return -1;
+        if (claw_response_append(resp, strcmp(doc->method, "GET") == 0 ? "get" : "post") != 0) return -1;
+        if (claw_response_append(resp, "\":{\"summary\":") != 0) return -1;
+        if (append_json_quoted(resp, doc->summary) != 0) return -1;
+        if (doc->request_schema_json && *doc->request_schema_json) {
+            if (claw_response_append(resp, ",\"requestBody\":{\"required\":true,\"content\":{\"application/json\":{\"schema\":") != 0) return -1;
+            if (append_runtime_schema_json(resp, doc, 1) != 0) return -1;
+            if (claw_response_append(resp, "}}}") != 0) return -1;
+        }
+        if (claw_response_append(resp, ",\"responses\":{\"200\":{\"description\":\"OK\",\"content\":{\"application/json\":{\"schema\":") != 0) return -1;
+        if (append_runtime_schema_json(resp, doc, 0) != 0) return -1;
+        if (claw_response_append(resp, "}}},\"400\":{\"description\":\"Bad Request\"},\"404\":{\"description\":\"Not Found\"},\"500\":{\"description\":\"Internal Server Error\"}},\"x-claw-runtime\":{\"name\":") != 0) return -1;
+        if (append_json_quoted(resp, doc->name) != 0) return -1;
+        if (claw_response_append(resp, "}}}") != 0) return -1;
+        have_path = 1;
     }
     return claw_response_append(resp, "},\"components\":{\"schemas\":{}}}");
 }
@@ -586,6 +944,13 @@ int claw_dispatch_list_modules(claw_dispatch_t *d, claw_response_t *resp)
         for (i = 0; i < r->tool_count; ++i) {
             if (i != 0 && claw_response_append(resp, ",") != 0) { rc = -1; break; }
             if (append_tool_schema_obj(resp, r->tools[i]) != 0) { rc = -1; break; }
+        }
+    }
+    if (rc == 0 && claw_response_append(resp, "],\"runtime_schemas\":[") != 0) rc = -1;
+    if (rc == 0) {
+        for (i = 0; i < runtime_route_doc_count(); ++i) {
+            if (i != 0 && claw_response_append(resp, ",") != 0) { rc = -1; break; }
+            if (append_runtime_schema_obj(resp, &RUNTIME_ROUTE_DOCS[i]) != 0) { rc = -1; break; }
         }
     }
     if (rc == 0 && claw_response_append(resp, "],\"openapi\":{\"path\":\"/openapi.json\"},") != 0) rc = -1;
@@ -738,6 +1103,40 @@ int claw_dispatch_tool_validate(claw_dispatch_t *d, const char *tool_name, const
         else if (claw_response_append(resp, ",\"validation\":\"passed\"}") != 0) rc = -1;
     }
     record_dispatch(d, CLAW_OP_LIST, tool_name, rc, started_ms, resp->len);
+    return rc;
+}
+
+int claw_dispatch_runtime_schemas(claw_dispatch_t *d, claw_response_t *resp)
+{
+    uint64_t started_ms = monotonic_ms();
+    size_t i;
+    int rc = 0;
+    if (!d || !resp) return -1;
+    if (claw_response_append(resp, "[") != 0) rc = -1;
+    for (i = 0; rc == 0 && i < runtime_route_doc_count(); ++i) {
+        if (i != 0 && claw_response_append(resp, ",") != 0) { rc = -1; break; }
+        if (append_runtime_schema_obj(resp, &RUNTIME_ROUTE_DOCS[i]) != 0) rc = -1;
+    }
+    if (rc == 0 && claw_response_append(resp, "]") != 0) rc = -1;
+    record_dispatch(d, CLAW_OP_LIST, "runtime_schemas", rc, started_ms,
+                    resp ? resp->len : 0);
+    return rc;
+}
+
+int claw_dispatch_runtime_schema_get(claw_dispatch_t *d, const char *name,
+                                     claw_response_t *resp)
+{
+    const claw_runtime_route_doc_t *doc;
+    uint64_t started_ms = monotonic_ms();
+    int rc;
+    if (!d || !name || !resp) return -1;
+    doc = find_runtime_route_doc(name);
+    if (!doc) {
+        record_dispatch(d, CLAW_OP_LIST, name, -2, started_ms, 0);
+        return -2;
+    }
+    rc = append_runtime_schema_obj(resp, doc);
+    record_dispatch(d, CLAW_OP_LIST, name, rc, started_ms, resp->len);
     return rc;
 }
 

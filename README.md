@@ -126,9 +126,24 @@ curl -X POST http://127.0.0.1:8080/v1/fs/write   -H 'Content-Type: application/j
 
 - Tool schema registry with versioned typed ABI for tools.
 - `list` now exposes `tool_schemas` automatically.
+- runtime non-tool endpoints now expose `runtime_schemas` automatically.
 - New CLI:
   - `tool-schemas`
   - `tool-schema <name>`
 - New HTTP:
   - `GET /v1/tools/schemas`
   - `GET /v1/tools/schema?name=<tool>`
+  - `GET /v1/runtime/schemas`
+  - `GET /v1/runtime/schema?name=<endpoint>`
+  - `POST /v1/tools/validate` with `{ "tool": "...", "args": { ... } }`
+
+Examples:
+
+```bash
+curl -X POST http://127.0.0.1:8080/v1/tools/validate \
+  -H 'Content-Type: application/json' \
+  -d '{"tool":"exec","args":{"argv":["printf","hello"],"cwd":"."}}'
+
+curl http://127.0.0.1:8080/v1/runtime/schemas
+curl 'http://127.0.0.1:8080/v1/runtime/schema?name=scheduler.task.upsert'
+```
