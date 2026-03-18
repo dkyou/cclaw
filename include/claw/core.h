@@ -35,5 +35,9 @@ const claw_provider_api_t *claw_registry_get_provider(
     const claw_registry_t *r, const char *name);
 const claw_memory_api_t *claw_registry_get_memory(
     const claw_registry_t *r, const char *name);
+const claw_tool_api_t *claw_registry_get_tool(
+    const claw_registry_t *r, const char *name);
+const claw_channel_api_t *claw_registry_get_channel(
+    const claw_registry_t *r, const char *name);
 
 #endif

@@ -5,7 +5,7 @@
 #include <stdint.h>
 #include <string.h>
 
-#define CLAW_PLUGIN_ABI_VERSION 1u
+#define CLAW_PLUGIN_ABI_VERSION 4u
 #define CLAW_NAME_MAX 64
 
 typedef enum {
@@ -36,16 +36,21 @@ claw_response_init(claw_response_t *r, char *buf, size_t cap)
 }
 
 static inline int
-claw_response_append(claw_response_t *r, const char *s)
+claw_response_append_mem(claw_response_t *r, const char *s, size_t n)
 {
-    size_t n;
-    if (!r || !r->buf || !s) return -1;
-    n = strlen(s);
+    if (!r || !r->buf || (!s && n != 0)) return -1;
     if (r->len + n + 1 > r->cap) return -1;
-    memcpy(r->buf + r->len, s, n);
+    if (n) memcpy(r->buf + r->len, s, n);
     r->len += n;
     r->buf[r->len] = '\0';
     return 0;
+}
+
+static inline int
+claw_response_append(claw_response_t *r, const char *s)
+{
+    if (!s) return -1;
+    return claw_response_append_mem(r, s, strlen(s));
 }
 
 typedef struct {
@@ -57,6 +62,7 @@ typedef struct {
     const char *name;
     int (*put)(const char *key, const char *value);
     int (*get)(const char *key, claw_response_t *resp);
+    int (*search)(const char *query, claw_response_t *resp);
 } claw_memory_api_t;
 
 typedef struct {
@@ -64,9 +70,18 @@ typedef struct {
     int (*invoke)(const char *json_args, claw_response_t *resp);
 } claw_tool_api_t;
 
+typedef struct claw_host_api {
+    int (*list_modules)(claw_response_t *resp);
+    int (*chat)(const char *provider, const char *message, claw_response_t *resp);
+    int (*memory_put)(const char *memory, const char *key, const char *value);
+    int (*memory_get)(const char *memory, const char *key, claw_response_t *resp);
+    int (*memory_search)(const char *memory, const char *query, claw_response_t *resp);
+    int (*tool_invoke)(const char *tool, const char *json_args, claw_response_t *resp);
+} claw_host_api_t;
+
 typedef struct {
     const char *name;
-    int (*start)(void);
+    int (*serve)(const claw_host_api_t *host);
     int (*stop)(void);
 } claw_channel_api_t;
 

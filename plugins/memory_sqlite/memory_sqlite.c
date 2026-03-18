@@ -7,6 +7,7 @@
 #include <time.h>
 
 #define CLAW_SQLITE_DEFAULT_PATH "./cclaw.db"
+#define CLAW_SQLITE_SEARCH_LIMIT 16
 
 typedef struct {
     sqlite3 *db;
@@ -59,7 +60,8 @@ static int ensure_db_ready(void)
         "  k TEXT PRIMARY KEY,"
         "  v TEXT NOT NULL,"
         "  updated_at INTEGER NOT NULL"
-        ");");
+        ");"
+        "CREATE INDEX IF NOT EXISTS idx_memories_updated_at ON memories(updated_at DESC);");
     if (rc != SQLITE_OK) {
         sqlite3_close(g_state.db);
         g_state.db = NULL;
@@ -130,10 +132,114 @@ static int sqlite_memory_get(const char *key, claw_response_t *resp)
     return -7;
 }
 
+static int append_json_escaped(claw_response_t *resp, const char *s)
+{
+    const unsigned char *p;
+    char tmp[7];
+    if (!resp || !s) return -1;
+    for (p = (const unsigned char *)s; *p; ++p) {
+        switch (*p) {
+        case '"':
+            if (claw_response_append(resp, "\\\"") != 0) return -1;
+            break;
+        case '\\':
+            if (claw_response_append(resp, "\\\\") != 0) return -1;
+            break;
+        case '\b':
+            if (claw_response_append(resp, "\\b") != 0) return -1;
+            break;
+        case '\f':
+            if (claw_response_append(resp, "\\f") != 0) return -1;
+            break;
+        case '\n':
+            if (claw_response_append(resp, "\\n") != 0) return -1;
+            break;
+        case '\r':
+            if (claw_response_append(resp, "\\r") != 0) return -1;
+            break;
+        case '\t':
+            if (claw_response_append(resp, "\\t") != 0) return -1;
+            break;
+        default:
+            if (*p < 0x20) {
+                snprintf(tmp, sizeof(tmp), "\\u%04x", (unsigned int)*p);
+                if (claw_response_append(resp, tmp) != 0) return -1;
+            } else if (claw_response_append_mem(resp, (const char *)p, 1) != 0) {
+                return -1;
+            }
+            break;
+        }
+    }
+    return 0;
+}
+
+static int sqlite_memory_search(const char *query, claw_response_t *resp)
+{
+    sqlite3_stmt *stmt = NULL;
+    static const char *SQL =
+        "SELECT k, v, updated_at FROM memories "
+        "WHERE k LIKE ? ESCAPE '\\' OR v LIKE ? ESCAPE '\\' "
+        "ORDER BY updated_at DESC LIMIT ?;";
+    char pattern[512];
+    int rc;
+    int first = 1;
+
+    if (!query || !resp) return -1;
+    rc = ensure_db_ready();
+    if (rc != SQLITE_OK) return -2;
+
+    if (snprintf(pattern, sizeof(pattern), "%%%s%%", query) >= (int)sizeof(pattern)) {
+        return -3;
+    }
+
+    rc = sqlite3_prepare_v2(g_state.db, SQL, -1, &stmt, NULL);
+    if (rc != SQLITE_OK) return -4;
+
+    sqlite3_bind_text(stmt, 1, pattern, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt, 2, pattern, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int(stmt, 3, CLAW_SQLITE_SEARCH_LIMIT);
+
+    if (claw_response_append(resp, "[") != 0) {
+        sqlite3_finalize(stmt);
+        return -5;
+    }
+
+    while ((rc = sqlite3_step(stmt)) == SQLITE_ROW) {
+        const unsigned char *k = sqlite3_column_text(stmt, 0);
+        const unsigned char *v = sqlite3_column_text(stmt, 1);
+        sqlite3_int64 updated_at = sqlite3_column_int64(stmt, 2);
+        char tsbuf[64];
+
+        if (!first && claw_response_append(resp, ",") != 0) {
+            sqlite3_finalize(stmt);
+            return -6;
+        }
+        first = 0;
+
+        snprintf(tsbuf, sizeof(tsbuf), "%lld", (long long)updated_at);
+        if (claw_response_append(resp, "{\"key\":\"") != 0 ||
+            append_json_escaped(resp, (const char *)(k ? k : (const unsigned char *)"")) != 0 ||
+            claw_response_append(resp, "\",\"value\":\"") != 0 ||
+            append_json_escaped(resp, (const char *)(v ? v : (const unsigned char *)"")) != 0 ||
+            claw_response_append(resp, "\",\"updated_at\":") != 0 ||
+            claw_response_append(resp, tsbuf) != 0 ||
+            claw_response_append(resp, "}") != 0) {
+            sqlite3_finalize(stmt);
+            return -7;
+        }
+    }
+
+    sqlite3_finalize(stmt);
+    if (rc != SQLITE_DONE) return -8;
+    if (claw_response_append(resp, "]") != 0) return -9;
+    return 0;
+}
+
 static const claw_memory_api_t SQLITE_MEMORY = {
     .name = "sqlite",
     .put = sqlite_memory_put,
     .get = sqlite_memory_get,
+    .search = sqlite_memory_search,
 };
 
 static const claw_module_descriptor_t SQLITE_DESC = {
