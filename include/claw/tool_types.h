@@ -601,7 +601,9 @@ static inline int claw_tt_error_json(claw_response_t *resp, const char *tool,
     return -1;
   if (claw_tt_append_json_escaped(resp, message ? message : "") != 0)
     return -1;
-  return claw_response_append(resp, "\"}}");
+  if (claw_response_append(resp, "\"}}") != 0)
+    return -1;
+  return -1;
 }
 
 static inline int claw_tt_exec_request_parse(const char *json,
